@@ -8,5 +8,5 @@ Skills набора:
 - taskless-review — ревью своего и чужого PR по классам дефектов.
 - taskless-debug — баг или падающий тест: первопричина до фикса.
 - taskless-ship — PR со ссылкой на задачу, обязательные проверки, закрытие после мержа.
-- taskless-po-chelovecheski — русские тексты для людей без канцелярита.
+- taskless-writing — русские тексты для людей без канцелярита.
 Тулов Taskless (get_task_context, save_spec) нет в списке — MCP не подключён: /mcp, сервер taskless, войти.

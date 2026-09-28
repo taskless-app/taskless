@@ -1,6 +1,6 @@
 # По-человечески: полный каталог
 
-Справочник к skill `taskless-po-chelovecheski`: все разделы оригинала без сокращений. Короткая выжимка и чек-лист — в `SKILL.md`.
+Справочник к skill `taskless-writing`: все разделы оригинала без сокращений. Короткая выжимка и чек-лист — в `SKILL.md`.
 
 Источник — репозиторий po-chelovecheski (https://github.com/ilyasmurov/po-chelovecheski, MIT), он основан на humanizer Сики Чена (https://github.com/blader/humanizer, MIT). Файл обновляется копированием оттуда, отдельно его не правят.
 

@@ -1,0 +1,18 @@
+{
+  "name": "@taskless/agent-kit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Taskless plugin for coding agents: Claude Code plugin + marketplace, MCP server, skills and hooks. Mirrored to github.com/taskless-app/taskless.",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "echo 'no lint in agent-kit yet'"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.4",
+    "typescript": "7.0.2",
+    "vitest": "2.1.8"
+  }
+}

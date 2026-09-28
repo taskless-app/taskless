@@ -1,0 +1,13 @@
+{
+  "name": "taskless",
+  "version": "0.1.0",
+  "description": "Taskless для агента: MCP-сервер Taskless и skills процесса — от разбора задачи до сдачи с доказательствами.",
+  "author": {
+    "name": "Taskless",
+    "url": "https://taskless.ru"
+  },
+  "homepage": "https://taskless.ru",
+  "repository": "https://github.com/taskless-app/taskless",
+  "license": "MIT",
+  "keywords": ["taskless", "mcp", "tasks", "workflow"]
+}

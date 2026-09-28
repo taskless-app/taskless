@@ -1,0 +1,15 @@
+{
+  "name": "taskless-app",
+  "description": "Плагины Taskless для Claude Code",
+  "owner": {
+    "name": "Taskless",
+    "url": "https://taskless.ru"
+  },
+  "plugins": [
+    {
+      "name": "taskless",
+      "source": "./",
+      "description": "Taskless для агента: MCP-сервер Taskless и skills процесса — от разбора задачи до сдачи с доказательствами."
+    }
+  ]
+}

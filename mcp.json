@@ -1,0 +1,12 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "taskless": {
+      "type": "streamable-http",
+      "url": "https://taskless.ru/api/mcp",
+      "headers": {
+        "X-Taskless-Kit": "0.1.0"
+      }
+    }
+  }
+}

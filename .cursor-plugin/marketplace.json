@@ -1,0 +1,16 @@
+{
+  "name": "taskless-app",
+  "owner": {
+    "name": "Taskless"
+  },
+  "metadata": {
+    "description": "Плагины Taskless для Cursor"
+  },
+  "plugins": [
+    {
+      "name": "taskless",
+      "source": "./",
+      "description": "Taskless для агента: MCP-сервер Taskless и skills процесса — от разбора задачи до сдачи с доказательствами."
+    }
+  ]
+}

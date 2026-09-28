@@ -1,0 +1,14 @@
+{
+  "name": "taskless",
+  "version": "0.1.0",
+  "description": "Taskless для агента: MCP-сервер Taskless и skills процесса — от разбора задачи до сдачи с доказательствами.",
+  "mcpServers": {
+    "taskless": {
+      "httpUrl": "https://taskless.ru/api/mcp",
+      "headers": {
+        "X-Taskless-Kit": "0.1.0"
+      }
+    }
+  },
+  "contextFileName": "CONTEXT.md"
+}

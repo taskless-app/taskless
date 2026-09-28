@@ -1,0 +1,24 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "extends": ["//"],
+  "tasks": {
+    // Набор — это не src/: тест проверяет манифесты, .mcp.json и тексты skills.
+    // С корневыми inputs (src/**, tests/**) правка SKILL.md отдавала бы
+    // зелёное из кеша, так и не прогнав проверку.
+    "test": {
+      "inputs": [
+        ".claude-plugin/**",
+        ".mcp.json",
+        "skills/**",
+        "hooks/**",
+        "README.md",
+        "tests/**",
+        "vitest*.config.*",
+        "package.json"
+      ]
+    },
+    "typecheck": {
+      "inputs": ["tests/**", "vitest*.config.*", "tsconfig*.json", "package.json"]
+    }
+  }
+}

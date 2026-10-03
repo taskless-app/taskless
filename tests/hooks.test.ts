@@ -175,3 +175,58 @@ describe("session-start.sh", () => {
     JSON.parse(decl);
   });
 });
+
+describe("swarm-watch.sh (Stop-хук надзора роя)", () => {
+  const runStop = (input: Record<string, unknown>, env: Record<string, string> = {}) => {
+    const res = spawnSync("sh", [hook("swarm-watch.sh")], {
+      input: JSON.stringify(input),
+      encoding: "utf8",
+      env: { ...process.env, ...env },
+    });
+    return { status: res.status ?? 0, stdout: res.stdout.trim() };
+  };
+  const transcript = (lines: string[]) => {
+    const dir = mkdtempSync(path.join(tmpdir(), "kit-swarm-watch-"));
+    const file = path.join(dir, "t.jsonl");
+    writeFileSync(file, lines.join("\n"));
+    return file;
+  };
+  // Сигнатура вызова тула — как в блоках tool_use Claude/ZCode; упоминание в тексте
+  // (без "name":"...) не считается.
+  const WAIT = '"name":"mcp__taskless__swarm_wait_event"';
+  const OTHER = '"name":"mcp__7f3e__swarm_list_runs"';
+
+  it("молчит без transcript_path и без CLAUDE_SESSION_ID (fail-open)", () => {
+    const r = runStop({ stop_hook_active: false });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toBe("");
+  });
+
+  it("молчит при stop_hook_active — повторный вызов не зацикливается", () => {
+    const r = runStop({ stop_hook_active: true, transcript_path: transcript([WAIT]) });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toBe("");
+  });
+
+  it("ход поднадзорен: wait_event в окне 250 — не блокирует", () => {
+    const lines = Array.from({ length: 300 }, (_, i) => (i < 299 ? OTHER : WAIT));
+    const r = runStop({ transcript_path: transcript(lines) });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toBe("");
+  });
+
+  it("блокирует: swarm-туры были, wait_event в хвосте нет", () => {
+    // 300 строк чужих swarm-туров + окно 250 без wait_event → блок с reason.
+    const lines = Array.from({ length: 300 }, () => OTHER);
+    const r = runStop({ transcript_path: transcript(lines) });
+    expect(r.stdout).toContain("decision");
+    expect(r.stdout).toContain("swarm_wait_event");
+  });
+
+  it("не блокирует чужую сессию: swarm-туров в окне 2000 нет", () => {
+    const lines = Array.from({ length: 300 }, () => '"type":"text","text":"упоминание swarm_wait_event в тексте"');
+    const r = runStop({ transcript_path: transcript(lines) });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toBe("");
+  });
+});

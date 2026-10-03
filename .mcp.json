@@ -4,7 +4,7 @@
       "type": "http",
       "url": "https://taskless.ru/api/mcp",
       "headers": {
-        "X-Taskless-Kit": "0.2.1"
+        "X-Taskless-Kit": "0.2.2"
       }
     }
   }

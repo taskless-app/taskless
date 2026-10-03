@@ -10,5 +10,6 @@
   "repository": "https://github.com/taskless-app/taskless",
   "license": "MIT",
   "keywords": ["taskless", "mcp", "tasks", "workflow"],
+  "skills": "./skills",
   "hooks": "./hooks/claude.json"
 }

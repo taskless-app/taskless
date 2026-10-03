@@ -14,7 +14,15 @@ input=$(cat)
 [ "$(printf '%s' "$input" | jq -r '.stop_hook_active // false' 2>/dev/null)" = "true" ] && exit 0
 
 t=$(printf '%s' "$input" | jq -r '.transcript_path // empty' 2>/dev/null)
-[ -n "$t" ] && [ -f "$t" ] || exit 0
+# ZCode может не передавать transcript_path: его собственный след сессии — файл обмена
+# rollout по CLAUDE_SESSION_ID из env хука (шаблонная переменная ZCode). Claude Code
+# ходит первой дорогой, ZCode — фолбэком, обе пишут tool_use как "name":"<тул>".
+if [ -z "$t" ] || [ ! -f "$t" ]; then
+  sid=${CLAUDE_SESSION_ID:-}
+  [ -n "$sid" ] || exit 0
+  t="$HOME/.zcode/cli/rollout/model-io-sess-$sid.jsonl"
+  [ -f "$t" ] || exit 0
+fi
 
 # Ищем ВЫЗОВ тула, а не упоминание в тексте (runbook §4: оркестратор пишет про
 # swarm_wait_event постоянно, голый grep по имени давал бы ложные срабатывания):

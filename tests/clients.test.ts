@@ -82,7 +82,13 @@ describe("Gemini CLI", () => {
     const file = path.join(root, ext.contextFileName as string);
     expect(existsSync(file)).toBe(true);
     const out = spawnSync("sh", [path.join(root, "hooks", "session-start.sh")], { encoding: "utf8" });
-    expect(out.stdout).toBe(readFileSync(file, "utf8"));
+    // Свод — JSON additionalContext (ZCode принимает только строгий JSON и сырой stdout
+    // выбрасывает), текст внутри вычищен как в json_str: переводы строк и табы — пробелы,
+    // слэши и кавычки вырезаны, хвостовые переводы строк сняты подстановкой команд.
+    const parsed = JSON.parse(out.stdout) as { hookSpecificOutput?: { hookEventName?: string; additionalContext?: string } };
+    expect(parsed.hookSpecificOutput?.hookEventName).toBe("SessionStart");
+    const norm = (s: string) => s.replace(/[\n\r\t]/g, " ").replace(/\\/g, " ").replace(/"/g, "'").trimEnd();
+    expect(parsed.hookSpecificOutput?.additionalContext).toBe(norm(readFileSync(file, "utf8")));
   });
 });
 
@@ -98,9 +104,11 @@ describe("хуки не лежат там, где их ищут чужие кл�
 });
 
 describe("skills — один каталог на всех", () => {
+  // ZCode не подхватывает skills по умолчанию — манифесту Claude Code нужно явное
+  // "./skills". Остальным клиентам объявление не мешает, поэтому разрешаем ровно его.
   it("ни один манифест не уводит skills из skills/, и skills там есть", () => {
     for (const rel of [".claude-plugin/plugin.json", "plugin.json", ".cursor-plugin/plugin.json", "gemini-extension.json"]) {
-      expect(read(rel).skills, rel).toBeUndefined();
+      expect([undefined, "./skills"], rel).toContain(read(rel).skills);
     }
     const skills = readdirSync(path.join(root, "skills")).filter((d) => existsSync(path.join(root, "skills", d, "SKILL.md")));
     expect(skills.length).toBeGreaterThan(0);

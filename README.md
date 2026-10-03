@@ -15,7 +15,7 @@
 - **Свод процесса** — `CONTEXT.md`: его печатает хук на старте сессии, а Gemini CLI
   грузит как файл контекста.
 
-Набор ставится в четыре клиента. Где что работает:
+Набор ставится в пять клиентов. Где что работает:
 
 | Клиент | Манифест | MCP | Skills | Хуки |
 | --- | --- | --- | --- | --- |
@@ -23,6 +23,7 @@
 | Cursor | `.cursor-plugin/plugin.json`, `mcp.json` | да | да | нет |
 | Codex CLI | `plugin.json`, `mcp.json` (Agent Plugins 1.0.0) | да | да | да, после доверия |
 | Gemini CLI | `gemini-extension.json` | да | да | нет |
+| ZCode | `.claude-plugin/plugin.json` | да | да | да |
 
 ## Skills
 
@@ -114,6 +115,17 @@ gemini extensions install https://github.com/taskless-app/taskless
 - С 18.06.2026 бесплатным пользователям и Google One вместо Gemini CLI выдают
   Antigravity CLI. Расширение работает там, где Gemini CLI остался: Code Assist
   Standard и Enterprise, Google Cloud, платные ключи API.
+
+### ZCode
+
+Plugin Marketplace → Add → Add Plugin Marketplace → `https://github.com/taskless-app/taskless`,
+затем Personal → taskless-app → taskless → Install. Работает с новой сессии.
+
+- Работает: MCP (`.claude-plugin/plugin.json`, заголовок `X-Taskless-Kit`), skills —
+  ZCode берёт их по явному полю `skills` в манифесте, без него не видит.
+- Хуки — тот же `hooks/claude.json`: ZCode принимает строгий JSON
+  `hookSpecificOutput.additionalContext` и молча выбрасывает сырой вывод. Проверено
+  живьём на macOS: свод на старте сессии, MCP и skills.
 
 ### Что не проверено
 

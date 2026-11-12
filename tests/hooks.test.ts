@@ -1,12 +1,12 @@
 // Хуки плагина: скрипты гоняются как есть, через sh, а gh и git подменены стабами в PATH.
 // Стаб отвечает тем, что лежит в переменных окружения теста, — так проверяется решение
 // хука, а не поведение настоящего GitHub.
-import { spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it } from "vitest";
 
 const kitDir = fileURLToPath(new URL("..", import.meta.url));
 const hook = (name: string) => path.join(kitDir, "hooks", name);
@@ -242,11 +242,297 @@ describe("merge-gate.sh", () => {
 });
 
 describe("session-start.sh", () => {
-  it("короткий свод: не длиннее 1500 символов и с правилом о главенстве проекта", () => {
-    const res = spawnSync("sh", [hook("session-start.sh")], { encoding: "utf8" });
+  const homes: string[] = [];
+  const servers: import("node:http").Server[] = [];
+
+  const home = () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "kit-session-home-"));
+    homes.push(dir);
+    return dir;
+  };
+  const withKey = (dir: string) => {
+    const helper = path.join(dir, ".config", "taskless", "mcp-headers");
+    mkdirSync(path.dirname(helper), { recursive: true });
+    writeFileSync(helper, '#!/bin/sh\nprintf \'{"Authorization":"Bearer tldev_test"}\\n\'\n');
+    chmodSync(helper, 0o700);
+  };
+  const withApiUrl = (dir: string, url: string) => {
+    const file = path.join(dir, ".config", "taskless", "api-url");
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, `${url}\n`);
+  };
+  const cloud = async (body: string, delayMs = 0) => {
+    const { createServer } = await import("node:http");
+    let authorization: string | undefined;
+    let requests = 0;
+    const server = createServer((req, res) => {
+      requests++;
+      authorization = req.headers.authorization;
+      setTimeout(() => {
+        res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+        res.end(body);
+      }, delayMs);
+    });
+    servers.push(server);
+    server.listen(0, "127.0.0.1");
+    await new Promise<void>((resolve) => server.once("listening", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("no test server port");
+    return {
+      url: `http://127.0.0.1:${address.port}/api`,
+      authorization: () => authorization,
+      requests: () => requests,
+    };
+  };
+  const start = (homeDir: string, apiUrl?: string) => spawnSync("sh", [hook("session-start.sh")], {
+    encoding: "utf8",
+    timeout: 5000,
+    env: { ...process.env, TASKLESS_SWARM_DRONE: "", SWARM_TASK_SLUG: "", HOME: homeDir, ...(apiUrl ? { TASKLESS_URL: apiUrl } : {}) },
+  });
+  const startAsync = (homeDir: string, apiUrl?: string, extraEnv: Record<string, string> = {}, shell = "sh") => new Promise<{
+    status: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string;
+  }>((resolve, reject) => {
+    const child = spawn(shell, [hook("session-start.sh")], {
+      env: { ...process.env, TASKLESS_SWARM_DRONE: "", SWARM_TASK_SLUG: "", HOME: homeDir, ...(apiUrl ? { TASKLESS_URL: apiUrl } : {}), ...extraEnv },
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    const timer = setTimeout(() => child.kill(), 5000);
+    child.on("close", (status, signal) => {
+      clearTimeout(timer);
+      resolve({ status, signal, stdout, stderr });
+    });
+  });
+  const context = (stdout: string) => {
+    const parsed = JSON.parse(stdout) as { hookSpecificOutput: { additionalContext: string } };
+    return parsed.hookSpecificOutput.additionalContext;
+  };
+
+  afterEach(async () => {
+    for (const dir of homes.splice(0)) rmSync(dir, { recursive: true, force: true });
+    for (const server of servers.splice(0)) {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("без ключа — прежний короткий свод, не длиннее 1500 символов", () => {
+    const res = start(home());
     expect(res.status).toBe(0);
+    expect(res.stderr).toBe("");
     expect(res.stdout.length).toBeLessThanOrEqual(1500);
     expect(res.stdout).toContain("Правила проекта главнее этого набора");
+  });
+
+  it("api-url на тестовый сервер — выжимка в additionalContext, ключ идёт Bearer, JSON валиден", async () => {
+    const dir = home();
+    withKey(dir);
+    const server = await cloud('## Личная память\n- "Сначала суть"\n- путь \\ и\nперевод строки');
+    withApiUrl(dir, server.url);
+    const res = await startAsync(dir);
+    expect(res.status).toBe(0);
+    expect(res.stderr).toBe("");
+    expect(server.authorization()).toBe("Bearer tldev_test");
+    const text = context(res.stdout);
+    expect(text).toContain("Правила проекта главнее этого набора");
+    expect(text).toContain("Сначала суть");
+    expect(text).toContain("перевод строки");
+  });
+
+  it("api-url с CRLF сохраняет выжимку", async () => {
+    const dir = home();
+    withKey(dir);
+    const server = await cloud("## Личная память\n- прочитано после CRLF");
+    writeFileSync(path.join(dir, ".config", "taskless", "api-url"), `${server.url}\r\n`);
+    const res = await startAsync(dir);
+    expect(res.status).toBe(0);
+    expect(server.requests()).toBe(1);
+    expect(context(res.stdout)).toContain("прочитано после CRLF");
+  });
+
+  it("TASKLESS_URL из env не получает ключ: чужой сервер видит ноль запросов", async () => {
+    const dir = home();
+    withKey(dir);
+    const server = await cloud("## Личная память\n- утечка");
+    const res = await startAsync(dir, server.url);
+    expect(res.status).toBe(0);
+    expect(server.requests()).toBe(0);
+    expect(res.stdout).not.toContain("утечка");
+  });
+
+  it("api-url с http не на петле — ноль запросов и прежний свод", async () => {
+    const dir = home();
+    withKey(dir);
+    const server = await cloud("## Личная память\n- не запрашивать");
+    const unsafeUrl = server.url.replace("127.0.0.1", "0.0.0.0");
+    withApiUrl(dir, unsafeUrl);
+    const res = await startAsync(dir, unsafeUrl);
+    expect(res.status).toBe(0);
+    expect(server.requests()).toBe(0);
+    expect(context(res.stdout)).toContain("Правила проекта главнее этого набора");
+    expect(res.stdout).not.toContain("не запрашивать");
+  });
+
+  it.each(["", "x"])("api-url с userinfo и суффиксом порта %q не отправляет ключ на чужой сервер", async (suffix) => {
+    const dir = home();
+    withKey(dir);
+    const recipient = await cloud("## Личная память\n- адресат");
+    const foreign = await cloud("## Личная память\n- утечка через userinfo");
+    const recipientPort = new URL(recipient.url).port;
+    const foreignPort = new URL(foreign.url).port;
+    withApiUrl(dir, `http://127.0.0.1:${recipientPort}${suffix}@127.0.0.1:${foreignPort}/`);
+    const res = await startAsync(dir);
+    expect(res.status).toBe(0);
+    expect(recipient.requests()).toBe(0);
+    expect(foreign.requests()).toBe(0);
+    expect(context(res.stdout)).toContain("Правила проекта главнее этого набора");
+    expect(res.stdout).not.toContain("утечка через userinfo");
+  });
+
+  it.each([
+    ["TASKLESS_SWARM_DRONE", { TASKLESS_SWARM_DRONE: "1" }],
+    ["SWARM_TASK_SLUG", { SWARM_TASK_SLUG: "PRJ2-999" }],
+  ])("у процесса дрона %s отключает запрос личной памяти", async (_name, extraEnv) => {
+    const dir = home();
+    withKey(dir);
+    const server = await cloud("## Личная память\n- не для дрона");
+    withApiUrl(dir, server.url);
+    const res = await startAsync(dir, undefined, extraEnv);
+    expect(res.status).toBe(0);
+    expect(server.requests()).toBe(0);
+    expect(context(res.stdout)).toContain("Правила проекта главнее этого набора");
+    expect(res.stdout).not.toContain("не для дрона");
+  });
+
+  it("выжимка с ESC и BEL не ломает JSON стартового свода", async () => {
+    const dir = home();
+    withKey(dir);
+    const server = await cloud("## Личная память\n- цвет \u001b[31mкрасный\u001b[0m звонок \u0007");
+    withApiUrl(dir, server.url);
+    const res = await startAsync(dir);
+    expect(res.status).toBe(0);
+    expect(() => JSON.parse(res.stdout)).not.toThrow();
+    expect(context(res.stdout)).toContain("цвет [31mкрасный[0m звонок");
+  });
+
+  it("медленный helper останавливается за 2 секунды, хук укладывается в 3", async () => {
+    const dir = home();
+    withKey(dir);
+    writeFileSync(
+      path.join(dir, ".config", "taskless", "mcp-headers"),
+      '#!/bin/sh\nsleep 8\nprintf \'{"Authorization":"Bearer tldev_test"}\\n\'\n',
+    );
+    const server = await cloud("## Личная память\n- слишком поздно");
+    withApiUrl(dir, server.url);
+    const before = Date.now();
+    const res = await startAsync(dir);
+    expect(res.status).toBe(0);
+    expect(res.signal).toBeNull();
+    expect(Date.now() - before).toBeLessThan(3000);
+    expect(server.requests()).toBe(0);
+    expect(context(res.stdout)).toContain("Правила проекта главнее этого набора");
+  }, 10_000);
+
+  it.each(["sh", "dash", "bash"])("таймаут helper гасит дочерние процессы в %s", async (shell) => {
+    const dir = home();
+    withKey(dir);
+    const pidFile = path.join(dir, "helper-child.pid");
+    writeFileSync(
+      path.join(dir, ".config", "taskless", "mcp-headers"),
+      '#!/bin/sh\nsleep 8 &\necho $! > "$HELPER_PID_FILE"\nwait\n',
+    );
+    const res = await startAsync(dir, undefined, { HELPER_PID_FILE: pidFile }, shell);
+    expect(res.status).toBe(0);
+    expect(res.stderr).toBe("");
+    expect(context(res.stdout)).toContain("Правила проекта главнее этого набора");
+    const childPid = Number(readFileSync(pidFile, "utf8"));
+    const isAlive = () => {
+      try {
+        process.kill(childPid, 0);
+        return true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+        throw error;
+      }
+    };
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      expect(isAlive()).toBe(false);
+    } finally {
+      if (isAlive()) process.kill(childPid, "SIGTERM");
+    }
+  }, 10_000);
+
+  it("таймаут добивает внука helper, который игнорирует TERM", async () => {
+    const dir = home();
+    withKey(dir);
+    const pidFile = path.join(dir, "helper-grandchild.pid");
+    writeFileSync(
+      path.join(dir, ".config", "taskless", "mcp-headers"),
+      '#!/bin/sh\nsh -c \'trap "" TERM; sleep 8\' &\necho $! > "$HELPER_PID_FILE"\nwait\n',
+    );
+    const before = Date.now();
+    const res = await startAsync(dir, undefined, { HELPER_PID_FILE: pidFile });
+    expect(res.status).toBe(0);
+    expect(res.stderr).toBe("");
+    expect(Date.now() - before).toBeLessThan(3000);
+    expect(context(res.stdout)).toContain("Правила проекта главнее этого набора");
+    const childPid = Number(readFileSync(pidFile, "utf8"));
+    const isAlive = () => {
+      try {
+        process.kill(childPid, 0);
+        return true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+        throw error;
+      }
+    };
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      expect(isAlive()).toBe(false);
+    } finally {
+      if (isAlive()) process.kill(childPid, "SIGKILL");
+    }
+  }, 10_000);
+
+  it("HTML вместо выжимки не попадает в контекст", async () => {
+    const dir = home();
+    withKey(dir);
+    const server = await cloud("<html><body>captive portal</body></html>");
+    withApiUrl(dir, server.url);
+    const res = await startAsync(dir);
+    expect(res.status).toBe(0);
+    expect(res.stdout).not.toContain("captive portal");
+    expect(context(res.stdout)).toContain("Правила проекта главнее этого набора");
+  });
+
+  it("ответ в 1 МБ обрезается до 4000 байт выжимки", async () => {
+    const dir = home();
+    withKey(dir);
+    const server = await cloud(`## Личная память\n- ${"x".repeat(1024 * 1024)}`);
+    withApiUrl(dir, server.url);
+    const res = await startAsync(dir);
+    expect(res.status).toBe(0);
+    expect(context(res.stdout)).toContain("## Личная память");
+    expect(res.stdout.length).toBeLessThan(6000);
+  });
+
+  it("облако не ответило за пару секунд — тихо прежний свод без зависания", async () => {
+    const dir = home();
+    withKey(dir);
+    const server = await cloud("не должно попасть", 3500);
+    withApiUrl(dir, server.url);
+    const before = Date.now();
+    const res = await startAsync(dir);
+    expect(res.status).toBe(0);
+    expect(res.signal).toBeNull();
+    expect(Date.now() - before).toBeLessThan(3000);
+    expect(res.stderr).toBe("");
+    expect(context(res.stdout)).toContain("Правила проекта главнее этого набора");
+    expect(res.stdout).not.toContain("не должно попасть");
   });
 
   // MCP-79: файл хуков Claude Code — hooks/claude.json (его же читает Codex);

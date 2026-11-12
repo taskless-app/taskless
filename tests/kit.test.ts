@@ -1,4 +1,5 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -21,7 +22,7 @@ interface Marketplace {
 }
 
 interface McpConfig {
-  mcpServers?: Record<string, { type?: string; url?: string; headers?: Record<string, string> }>;
+  mcpServers?: Record<string, { type?: string; url?: string; headers?: Record<string, string>; headersHelper?: string }>;
 }
 
 const plugin = readJson(path.join(root, ".claude-plugin/plugin.json")) as PluginManifest;
@@ -55,6 +56,35 @@ describe("манифесты", () => {
     expect(server?.type).toBe("http");
     expect(server?.url).toBe("https://taskless.ru/api/mcp");
     expect(server?.headers?.["X-Taskless-Kit"]).toBe(plugin.version);
+    expect(server?.headersHelper).toBe('node "${CLAUDE_PLUGIN_ROOT}/connect/plugin-headers.mjs"');
+  });
+
+  it("plugin-headers вызывает постоянный helper, а без него оставляет OAuth", () => {
+    const home = mkdtempSync(path.join(tmpdir(), "plugin-headers-"));
+    const helper = path.join(home, ".config", "taskless", "mcp-headers");
+    const script = path.join(root, "connect", "plugin-headers.mjs");
+    expect(readFileSync(script, "utf8")).toContain('["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", helper]');
+    const invoke = () => spawnSync(process.execPath, [script], {
+      env: { ...process.env, HOME: home },
+      encoding: "utf8",
+    });
+    const missing = invoke();
+    expect(missing.status, missing.stderr).toBe(0);
+    expect(JSON.parse(missing.stdout)).toEqual({});
+    mkdirSync(path.dirname(helper), { recursive: true });
+    writeFileSync(helper, '#!/bin/sh\nprintf \'{"Authorization":"Bearer tldev_test"}\\n\'\n');
+    chmodSync(helper, 0o700);
+    const present = invoke();
+    expect(present.status, present.stderr).toBe(0);
+    expect(JSON.parse(present.stdout)).toEqual({ Authorization: "Bearer tldev_test" });
+    const noShell = spawnSync(process.execPath, [script], {
+      env: { ...process.env, HOME: home, PATH: path.join(home, "missing-bin") },
+      encoding: "utf8",
+    });
+    expect(noShell.status, noShell.stderr).toBe(0);
+    expect(noShell.stderr).toBe("");
+    expect(JSON.parse(noShell.stdout)).toEqual({});
+    rmSync(home, { recursive: true, force: true });
   });
 });
 

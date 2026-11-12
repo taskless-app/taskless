@@ -81,7 +81,10 @@ describe("Gemini CLI", () => {
     const ext = read("gemini-extension.json");
     const file = path.join(root, ext.contextFileName as string);
     expect(existsSync(file)).toBe(true);
-    const out = spawnSync("sh", [path.join(root, "hooks", "session-start.sh")], { encoding: "utf8" });
+    const out = spawnSync("sh", [path.join(root, "hooks", "session-start.sh")], {
+      encoding: "utf8",
+      env: { ...process.env, HOME: path.join(root, ".test-home-without-device-key") },
+    });
     // Свод — JSON additionalContext (ZCode принимает только строгий JSON и сырой stdout
     // выбрасывает), текст внутри вычищен как в json_str: переводы строк и табы — пробелы,
     // слэши и кавычки вырезаны, хвостовые переводы строк сняты подстановкой команд.

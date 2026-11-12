@@ -7,14 +7,17 @@
 #
 # Режимы: без флагов подключает всех найденных; --dry-run только показывает;
 # --only claude-code,codex; --status; --uninstall снимает наши правки и
-# отзывает ключ. Ключ — macOS Keychain (`security`), Linux libsecret
-# (`secret-tool`), иначе файл ~/.config/taskless/device-key с правами 600.
+# отзывает ключ. --memory-dir добавляет источники памяти, --memory on|off
+# меняет настройку, --import-memory отправляет согласованные записи.
+# Ключ — macOS Keychain (`security`), Linux libsecret
+# (`secret-tool`) плюс файл ~/.config/taskless/device-key с правами 600 для
+# MCP helper без D-Bus; без связки ключ хранится только в этом файле.
 #
-# Адаптер клиента (MCP-105, MCP-106 допишут настоящие) — три действия:
-# найти, прописать, снять. Правка файла только блоком между
-# `# >>> taskless:<id>` и `# <<< taskless:<id>`. Перед первой правкой —
-# копия `<файл>.bak-taskless`. Повтор заменяет блок, чужие строки не трогает.
-# Сейчас поиск у всех десяти id из словаря устройства отвечает «нет».
+# Адаптер клиента — три действия: найти, прописать, снять. TOML и скрипты
+# правятся блоком между `# >>> taskless:<id>` и `# <<< taskless:<id>`;
+# ~/.claude.json — только по ключу mcpServers.taskless. Перед первой правкой —
+# копия `<файл>.bak-taskless`. Повтор без дублей, чужие ключи не трогаются.
+# Подключены Claude Code и Codex (MCP-105), остальные — MCP-106 и позже.
 # Заглушка для тестов: TASKLESS_CONNECT_STUB=1 и TASKLESS_STUB_AGENTS.
 #
 # TASKLESS_URL — база API, по умолчанию https://taskless.ru/api.
@@ -28,6 +31,9 @@ AGENT_IDS="claude-code codex grok zcode cursor gemini opencode copilot qwen kimi
 DRY=0
 DO_STATUS=0
 DO_UNINSTALL=0
+MEMORY_SET=
+IMPORT_FILE=
+MEMORY_DIRS=
 ONLY=
 HELPER=
 RUNTIME=
@@ -72,6 +78,9 @@ Taskless: подключение агентов на этом компьютер
   sh connect.sh --only claude-code,codex
   sh connect.sh --status                что подключено
   sh connect.sh --uninstall             снять поставленное и отозвать ключ
+  sh connect.sh --memory-dir ~/notes    также найти память в своей папке
+  sh connect.sh --memory on|off         включить или выключить личную память
+  sh connect.sh --import-memory <файл>  отправить согласованные записи
 EOF
 }
 
@@ -192,13 +201,19 @@ stub_manual() {
   esac
 }
 
-# Найти. Настоящий поиск клиента — в адаптере следующей задачи.
-# Пока клиент не написан, его на машине нет: код у сервера не просим.
 agent_found() {
   if stub_wants "$1"; then
     return 0
   fi
-  return 1
+  case "$1" in
+    claude-code)
+      command -v claude >/dev/null 2>&1 || [ -f "$HOME/.claude.json" ] || [ -d "$HOME/.claude" ]
+      ;;
+    codex)
+      command -v codex >/dev/null 2>&1 || [ -f "$HOME/.codex/config.toml" ] || [ -d "$HOME/.codex" ]
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 parse_args() {
@@ -217,6 +232,47 @@ parse_args() {
       --only=*)
         normalize_only "${1#--only=}"
         ;;
+      --memory)
+        shift
+        if [ $# -lt 1 ]; then
+          die "После --memory нужно on или off."
+        fi
+        MEMORY_SET=$1
+        ;;
+      --memory=*)
+        MEMORY_SET=${1#--memory=}
+        if [ -z "$MEMORY_SET" ]; then
+          die "После --memory нужно on или off."
+        fi
+        ;;
+      --import-memory)
+        shift
+        if [ $# -lt 1 ]; then
+          die "После --import-memory нужен JSON-файл."
+        fi
+        IMPORT_FILE=$1
+        ;;
+      --import-memory=*)
+        IMPORT_FILE=${1#--import-memory=}
+        if [ -z "$IMPORT_FILE" ]; then
+          die "После --import-memory нужен JSON-файл."
+        fi
+        ;;
+      --memory-dir)
+        shift
+        if [ $# -lt 1 ]; then
+          die "После --memory-dir нужен путь."
+        fi
+        MEMORY_DIRS="${MEMORY_DIRS}${MEMORY_DIRS:+
+}$1"
+        ;;
+      --memory-dir=*)
+        if [ "$1" = "--memory-dir=" ]; then
+          die "После --memory-dir нужен путь."
+        fi
+        MEMORY_DIRS="${MEMORY_DIRS}${MEMORY_DIRS:+
+}${1#--memory-dir=}"
+        ;;
       -h|--help)
         usage
         exit 0
@@ -232,6 +288,15 @@ parse_args() {
   fi
   if [ "$DO_STATUS" = 1 ] && [ "$DRY" = 1 ]; then
     die "--status ничего не меняет и без --dry-run."
+  fi
+  if [ -n "$MEMORY_SET" ] && [ "$MEMORY_SET" != "on" ] && [ "$MEMORY_SET" != "off" ]; then
+    die "После --memory нужно on или off."
+  fi
+  if [ -n "$MEMORY_SET" ] && [ -n "$IMPORT_FILE" ]; then
+    die "Укажи что-то одно: --memory или --import-memory."
+  fi
+  if { [ -n "$MEMORY_SET" ] || [ -n "$IMPORT_FILE" ]; } && { [ "$DO_STATUS" = 1 ] || [ "$DO_UNINSTALL" = 1 ]; }; then
+    die "Ключи личной памяти не совмещаются с --status и --uninstall."
   fi
 }
 
@@ -295,9 +360,6 @@ print_manuals() {
       *" $id "*) ;;
       *) continue ;;
     esac
-    if ! stub_wants "$id"; then
-      continue
-    fi
     line=$(stub_manual "$id")
     if [ -z "$line" ]; then
       continue
@@ -387,7 +449,7 @@ prepare_helper() {
     HELPER="$raw.py"
     mv "$raw" "$HELPER"
     cat > "$HELPER" <<'TASKLESS_CONNECT_PY_END'
-import json, os, re, sys, tempfile, urllib.error, urllib.request
+import datetime, json, os, re, sys, tempfile, urllib.error, urllib.request
 
 OS_RE = re.compile(r"^[0-9A-Za-z .()_-]{1,32}$")
 PLATFORMS = ("macos", "linux", "windows")
@@ -433,7 +495,12 @@ def request(method, url, payload=None, token=""):
     data = None
     headers = {"Accept": "application/json"}
     if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
+        body = json.dumps(payload, ensure_ascii=False)
+        # Одиночная половинка суррогатной пары (текст оборван посреди эмодзи) в utf-8
+        # не кодируется. Пишем её escape-последовательностью, как JSON.stringify в node.
+        # Целые пары python хранит одним символом, так что сюда попадают только одиночные.
+        body = re.sub("[\ud800-\udfff]", lambda m: "\\u%04x" % ord(m.group()), body)
+        data = body.encode("utf-8")
         headers["Content-Type"] = "application/json"
     if token:
         headers["Authorization"] = "Bearer " + token
@@ -479,13 +546,16 @@ def find_line(data, needle, start):
         pos = i + 1
 
 def find_mark(data, mark, start):
-    # Строка-метка с \n или \r\n: файл могли пересохранить с CRLF. Ближняя из двух.
+    # Строка-метка с \n, \r\n или в конце файла без перевода. Ближняя из трёх.
     # Возвращает (позиция, длина строки с переводом) или (-1, 0).
     best = (-1, 0)
     for nl in (b"\n", b"\r\n"):
         i = find_line(data, mark + nl, start)
         if i >= 0 and (best[0] < 0 or i < best[0]):
             best = (i, len(mark) + len(nl))
+    i = find_line(data, mark, start)
+    if i >= 0 and i + len(mark) == len(data) and (best[0] < 0 or i < best[0]):
+        best = (i, len(mark))
     return best
 
 def link_dest(path):
@@ -514,6 +584,218 @@ def emit_edit(changed, backup, created, deleted):
     sys.stdout.write("created=%s\n" % (1 if created else 0))
     sys.stdout.write("deleted=%s\n" % (1 if deleted else 0))
 
+def toml_key(raw):
+    key = re.sub(br"[ \t]+", b"", raw.strip())
+    return key.replace(b'"taskless"', b"taskless").replace(b"'taskless'", b"taskless")
+
+def toml_kind(key):
+    if key == b"mcp_servers.taskless" or key.startswith(b"mcp_servers.taskless."):
+        return "mcp"
+    plugin = b'plugins."taskless@taskless-app".mcp_servers.taskless'
+    if key == plugin or key.startswith(plugin + b"."):
+        return "plugin"
+    return None
+
+def toml_header(line):
+    array = re.match(br"^[ \t]*\[\[([^\[\]]+)\]\][ \t]*(?:#.*)?(?:\r?\n)?$", line)
+    if array:
+        return b"[]" + toml_key(array.group(1))
+    match = re.match(br"^[ \t]*\[([^\[\]]+)\][ \t]*(?:#.*)?(?:\r?\n)?$", line)
+    return toml_key(match.group(1)) if match else None
+
+def toml_mask(data):
+    out = bytearray(data)
+    state = ""
+    i = 0
+    while i < len(data):
+        char = data[i]
+        if state in ("basic", "literal"):
+            if state == "basic" and char == 92:
+                i += 2
+                continue
+            if char == (34 if state == "basic" else 39) or char == 10:
+                state = ""
+            i += 1
+            continue
+        if state in ("basic3", "literal3"):
+            delimiter = b'"""' if state == "basic3" else b"'''"
+            if data.startswith(delimiter, i):
+                state = ""
+                i += 3
+                continue
+            if state == "basic3" and char == 92:
+                out[i] = 32
+                if i + 1 < len(data) and data[i + 1] not in (10, 13):
+                    out[i + 1] = 32
+                i += 2
+                continue
+            if char not in (10, 13):
+                out[i] = 32
+            i += 1
+            continue
+        if char == 35:
+            nl = data.find(b"\n", i)
+            i = len(data) if nl < 0 else nl
+            continue
+        if char in (34, 39):
+            delimiter = bytes([char]) * 3
+            if data.startswith(delimiter, i):
+                state = "basic3" if char == 34 else "literal3"
+                i += 3
+            else:
+                state = "basic" if char == 34 else "literal"
+                i += 1
+            continue
+        i += 1
+    return bytes(out), state
+
+def toml_assignment_end(masked, pos, next_pos):
+    balance = 0
+    scan = pos
+    first = True
+    while scan < len(masked):
+        line = masked[scan:next_pos]
+        eq = line.find(b"=") if first else -1
+        rhs = line[eq + 1:] if eq >= 0 else line
+        rhs = re.sub(br'"(?:\\.|[^"\\])*"|\'[^\']*\'', b"", rhs).split(b"#", 1)[0]
+        balance += rhs.count(b"[") - rhs.count(b"]") + rhs.count(b"{") - rhs.count(b"}")
+        if balance <= 0:
+            return next_pos
+        first = False
+        scan = next_pos
+        nl = masked.find(b"\n", scan)
+        next_pos = len(masked) if nl < 0 else nl + 1
+    return len(masked)
+
+def toml_taskless_ranges(data):
+    masked, _open = toml_mask(data)
+    ranges = []
+    section = b""
+    pos = 0
+    while pos < len(data):
+        nl = data.find(b"\n", pos)
+        next_pos = len(data) if nl < 0 else nl + 1
+        line = masked[pos:next_pos]
+        header = toml_header(line)
+        if header is not None:
+            section = header
+            kind = toml_kind(section)
+            if kind is not None:
+                start = pos
+                end = len(data)
+                scan = next_pos
+                while scan < len(data):
+                    scan_nl = data.find(b"\n", scan)
+                    scan_next = len(data) if scan_nl < 0 else scan_nl + 1
+                    next_header = toml_header(masked[scan:scan_next])
+                    if next_header is not None and not next_header.startswith(section + b"."):
+                        end = scan
+                        break
+                    scan = scan_next
+                ranges.append((start, end, kind))
+                pos = end
+                continue
+        else:
+            eq = line.find(b"=")
+            if eq >= 0:
+                left = toml_key(line[:eq])
+                full = (section + b"." if section else b"") + left
+                kind = toml_kind(full)
+                if kind is not None:
+                    end = toml_assignment_end(masked, pos, next_pos)
+                    ranges.append((pos, end, kind))
+                    pos = end
+                    continue
+        pos = next_pos
+    return ranges
+
+def toml_remove_ranges(data, ranges):
+    out = []
+    pos = 0
+    for start, end, _kind in sorted(ranges):
+        out.append(data[pos:start])
+        pos = end
+    out.append(data[pos:])
+    return b"".join(out)
+
+def toml_restore_anchor(bak, pos, ranges):
+    masked, _open = toml_mask(bak)
+    while pos < len(bak):
+        inside = next((end for start, end, _kind in ranges if start <= pos < end), None)
+        if inside is not None:
+            pos = inside
+            continue
+        nl = bak.find(b"\n", pos)
+        next_pos = len(bak) if nl < 0 else nl + 1
+        header = toml_header(masked[pos:next_pos])
+        if header is not None:
+            return header
+        pos = next_pos
+    return None
+
+def toml_find_header(data, wanted):
+    masked, _open = toml_mask(data)
+    pos = 0
+    while pos < len(data):
+        nl = data.find(b"\n", pos)
+        next_pos = len(data) if nl < 0 else nl + 1
+        if toml_header(masked[pos:next_pos]) == wanted:
+            return pos
+        pos = next_pos
+    return len(data)
+
+def toml_restore_ranges(stripped, bak, ranges):
+    base = toml_remove_ranges(bak, ranges)
+    if stripped == base or (stripped == base + b"\n" and not base.endswith(b"\n")):
+        return bak
+    new = stripped
+    for start, end, _kind in sorted(ranges):
+        anchor = toml_restore_anchor(bak, end, ranges)
+        at = toml_find_header(new, anchor) if anchor is not None else len(new)
+        if anchor is not None and at == len(new):
+            label = "[[" + anchor[2:].decode("utf-8") + "]]" if anchor.startswith(b"[]") else anchor.decode("utf-8")
+            sys.stderr.write("Предупреждение: заголовок %s не найден, восстанавливаю taskless в конец TOML.\n" % label)
+        sep = b""
+        if at > 0 and new[at - 1:at] != b"\n":
+            sep = b"\r\n" if b"\r\n" in new else b"\n"
+        new = new[:at] + sep + bak[start:end] + new[at:]
+    return new
+
+def toml_validate(path, data, installed=True):
+    masked, open_string = toml_mask(data)
+    if open_string:
+        sys.stderr.write("Не смог разобрать итоговый TOML %s: незакрытая строка. Файл не меняю.\n" % path)
+        sys.exit(1)
+    try:
+        import tomllib
+    except ImportError:
+        tomllib = None
+    if tomllib is not None:
+        try:
+            tomllib.loads(data.decode("utf-8"))
+        except Exception as err:
+            sys.stderr.write("Не смог разобрать итоговый TOML %s: %s. Файл не меняю.\n" % (path, err))
+            sys.exit(1)
+    if installed:
+        counts = {"mcp": 0, "plugin": 0}
+        for _start, _end, kind in toml_taskless_ranges(data):
+            counts[kind] += 1
+        root_inline = False
+        pos = 0
+        while pos < len(masked):
+            nl = masked.find(b"\n", pos)
+            next_pos = len(masked) if nl < 0 else nl + 1
+            line = masked[pos:next_pos]
+            if toml_header(line) is not None:
+                break
+            if re.match(br"^[ \t]*mcp_servers[ \t]*=[ \t]*\{", line):
+                root_inline = True
+                break
+            pos = next_pos
+        if counts != {"mcp": 1, "plugin": 1} or root_inline:
+            sys.stderr.write("В итоговом TOML %s дублируется taskless. Файл не меняю.\n" % path)
+            sys.exit(1)
+
 def apply_block(path, begin, end, inner, dry, mode):
     begin_b = (begin + "\n").encode()
     end_b = (end + "\n").encode()
@@ -527,8 +809,10 @@ def apply_block(path, begin, end, inner, dry, mode):
     else:
         bpos, blen = find_mark(old, begin.encode(), 0)
         if bpos < 0:
-            sep = b"" if old.endswith(b"\n") or old == b"" else b"\n"
-            new = old + sep + block
+            ranges = toml_taskless_ranges(old) if begin == "# >>> taskless:codex" else []
+            base = toml_remove_ranges(old, ranges) if ranges else old
+            sep = b"" if base.endswith(b"\n") or base == b"" else b"\n"
+            new = base + sep + block
         else:
             epos, elen = find_mark(old, end.encode(), bpos + blen)
             if epos < 0:
@@ -539,6 +823,8 @@ def apply_block(path, begin, end, inner, dry, mode):
     if not changed:
         emit_edit(False, "", False, False)
         return
+    if begin == "# >>> taskless:codex" and b"[mcp_servers.taskless]" in inner:
+        toml_validate(path, new)
     bak = path + ".bak-taskless"
     backup = ""
     if old is not None and not os.path.exists(bak):
@@ -571,9 +857,12 @@ def remove_block(path, begin, end, dry, mode):
     stripped = old[:bpos] + old[epos + elen:]
     bak_path = path + ".bak-taskless"
     bak = open(bak_path, "rb").read() if os.path.isfile(bak_path) else None
-    new = stripped
+    original = toml_taskless_ranges(bak) if bak is not None and begin == "# >>> taskless:codex" else []
+    new = toml_restore_ranges(stripped, bak, original) if original else stripped
     if bak is not None and (stripped == bak or (stripped == bak + b"\n" and not bak.endswith(b"\n"))):
         new = bak
+    if begin == "# >>> taskless:codex":
+        toml_validate(path, new, False)
     if dry:
         # Пустую копию возвращаем пустым файлом, а не удалением.
         emit_edit(True, "", False, new == b"" and bak is None)
@@ -587,6 +876,116 @@ def remove_block(path, begin, end, dry, mode):
     if bak is not None and new == bak and os.path.isfile(bak_path):
         os.remove(bak_path)
     emit_edit(True, "", False, deleted)
+
+def json_parse(raw, path):
+    if not raw or not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except Exception:
+        sys.stderr.write("Не смог разобрать JSON %s. Файл не меняю.\n" % path)
+        sys.exit(1)
+    if not isinstance(data, dict):
+        sys.stderr.write("В JSON %s жду объект в корне. Файл не меняю.\n" % path)
+        sys.exit(1)
+    return data
+
+def json_read(path):
+    raw = open(path, "rb").read() if os.path.isfile(path) else None
+    return raw, json_parse(raw, path)
+
+def json_server():
+    return {
+        "type": "http",
+        "url": os.environ.get("TASKLESS_MCP_URL", ""),
+        "headersHelper": os.environ.get("TASKLESS_HEADER_COMMAND", ""),
+    }
+
+def json_taskless_owned(server):
+    if not isinstance(server, dict) or not isinstance(server.get("headersHelper"), str):
+        return False
+    helper_path = os.path.join(os.environ.get("HOME", ""), ".config", "taskless", "mcp-headers")
+    return helper_path in server["headersHelper"]
+
+def json_dump(data):
+    return (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+def json_apply(path, dry):
+    raw, data = json_read(path)
+    servers = data.get("mcpServers")
+    if servers is None:
+        servers = {}
+        data["mcpServers"] = servers
+    if not isinstance(servers, dict):
+        sys.stderr.write("В JSON %s ключ mcpServers не объект. Файл не меняю.\n" % path)
+        sys.exit(1)
+    wanted = json_server()
+    if servers.get("taskless") == wanted:
+        emit_edit(False, "", False, False)
+        return
+    servers["taskless"] = wanted
+    bak = path + ".bak-taskless"
+    backup = bak if raw is not None and not os.path.isfile(bak) else ""
+    if dry:
+        emit_edit(True, backup, raw is None, False)
+        return
+    if backup:
+        open(bak, "wb").write(raw)
+        os.chmod(bak, os.stat(path).st_mode & 0o777)
+    mode = os.stat(path).st_mode & 0o777 if raw is not None else 0o600
+    write_atomic(path, json_dump(data), mode)
+    emit_edit(True, backup, raw is None, False)
+
+def json_remove(path, dry):
+    if not os.path.isfile(path):
+        emit_edit(False, "", False, False)
+        return
+    raw, data = json_read(path)
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict) or not json_taskless_owned(servers.get("taskless")):
+        emit_edit(False, "", False, False)
+        return
+    bak_path = path + ".bak-taskless"
+    bak_raw = open(bak_path, "rb").read() if os.path.isfile(bak_path) else None
+    bak_data = json_parse(bak_raw, bak_path) if bak_raw is not None else None
+    del servers["taskless"]
+    bak_servers = bak_data.get("mcpServers") if bak_data is not None else None
+    if isinstance(bak_servers, dict) and "taskless" in bak_servers:
+        servers["taskless"] = bak_servers["taskless"]
+    if not servers and (bak_data is None or not bak_data.get("mcpServers")):
+        del data["mcpServers"]
+    if dry:
+        emit_edit(True, "", False, bak_data is None and data == {})
+        return
+    deleted = False
+    if bak_data is None and data == {}:
+        os.remove(link_dest(path))
+        deleted = True
+    elif bak_raw is not None and data == bak_data:
+        write_atomic(path, bak_raw, os.stat(path).st_mode & 0o777)
+    else:
+        write_atomic(path, json_dump(data), os.stat(path).st_mode & 0o777)
+    if bak_raw is not None:
+        os.remove(bak_path)
+    emit_edit(True, "", False, deleted)
+
+def json_status(path):
+    if not os.path.isfile(path):
+        emit_edit(False, "", False, False)
+        return
+    _raw, data = json_read(path)
+    servers = data.get("mcpServers")
+    connected = isinstance(servers, dict) and json_taskless_owned(servers.get("taskless"))
+    emit_edit(connected, "", False, False)
+
+def toml_block():
+    url = json.dumps(os.environ.get("TASKLESS_MCP_URL", ""), ensure_ascii=False)
+    command = json.dumps(os.environ.get("TASKLESS_HEADER_COMMAND", ""), ensure_ascii=False)
+    sys.stdout.write("[mcp_servers.taskless]\n")
+    sys.stdout.write("url = %s\n" % url)
+    sys.stdout.write("http_headers_helper = %s\n\n" % command)
+    sys.stdout.write('[plugins."taskless@taskless-app".mcp_servers.taskless]\n')
+    sys.stdout.write("enabled = false\n")
 
 def meta_write():
     path = sys.argv[2]
@@ -623,6 +1022,406 @@ def meta_read():
     sys.stdout.write("store=%s\n" % str(data.get("store") or "").replace("\n", " "))
     sys.stdout.write("agents=%s\n" % ",".join(str(a) for a in agents))
 
+def emit_memory_field(key, value):
+    sys.stdout.write("%s=%s\n" % (key, str(value if value is not None else "").replace("\n", " ").replace("\r", "")))
+
+def server_message(payload, net=""):
+    if net:
+        return net
+    if isinstance(payload, dict):
+        for key in ("message", "error", "detail"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return "неизвестная ошибка сервера"
+
+def memory_state():
+    status, retry, net, payload = request("GET", base() + "/memory/personal/settings", None, os.environ.get("TASKLESS_TOKEN", ""))
+    state = payload.get("state") if isinstance(payload, dict) else None
+    emit_memory_field("status", status)
+    emit_memory_field("net_error", net)
+    emit_memory_field("memory_state", state if state in ("on", "off") else "")
+    emit_memory_field("server_message", server_message(payload, net) if status != 200 else "")
+
+def memory_set(value):
+    status, retry, net, payload = request("PUT", base() + "/memory/personal/settings", {"enabled": value == "on"}, os.environ.get("TASKLESS_TOKEN", ""))
+    if status != 200:
+        sys.stderr.write(server_message(payload, net) + "\n")
+        sys.exit(1)
+    emit_memory_field("status", status)
+
+SECRET_WORDS = {"password", "passwd", "пароль", "token", "secret", "apikey", "ключ"}
+SECRET_KEY_OWNERS = {"api", "secret", "access"}
+SECRET_PLACEHOLDER = re.compile(r"^(?:true|false|null|none|undefined|empty|redacted|x+|\*+|\.+)$", re.I)
+NOT_SECRET_VALUE = re.compile(r"^(?:@?[A-Z][A-Z0-9]*-\d+|v?\d+(?:\.\d+)+(?:[-+][\w.]+)?|\d{4}-\d{2}-\d{2}(?:[T ]?[\d:.]+Z?)?|\d{1,2}:\d{2}(?::\d{2})?)$")
+
+def is_secret_name(name):
+    split = re.sub(r"([a-zа-яё0-9])([A-ZА-ЯЁ])", r"\1_\2", name)
+    split = re.sub(r"([A-ZА-ЯЁ])([A-ZА-ЯЁ][a-zа-яё])", r"\1_\2", split).lower()
+    words = [word for word in re.split(r"[_-]+", split) if word]
+    if not words:
+        return False
+    if words[-1] in SECRET_WORDS:
+        return True
+    return words[-1] == "key" and len(words) > 1 and words[-2] in SECRET_KEY_OWNERS
+
+def accept_assigned_secret(value, match):
+    if not is_secret_name(match.group("name")):
+        return False
+    if SECRET_PLACEHOLDER.match(value) or re.match(r"^[$%{<]", value) or value.startswith("process.env"):
+        return False
+    if NOT_SECRET_VALUE.match(value):
+        return False
+    if match.group("sep") == "=":
+        return len(value) >= 4
+    return len(value) >= 6 and any(not ch.isalpha() for ch in value)
+
+L = r"(?<![A-Za-z0-9_])"
+R = r"(?![A-Za-z0-9_])"
+SECRET_PATTERNS = [
+    (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"), None),
+    (re.compile(L + r"(?:tlswarm|tldev|tlsec|tldc|tla|tlr|tlc)_[A-Za-z0-9_-]{20,}"), None),
+    (re.compile(L + r"gh[pousr]_[A-Za-z0-9]{30,}" + R), None),
+    (re.compile(L + r"github_pat_[A-Za-z0-9_]{22,}"), None),
+    (re.compile(L + r"sk-ant-[A-Za-z0-9_-]{20,}"), None),
+    (re.compile(L + r"sk-[A-Za-z0-9_-]{20,}"), "digit"),
+    (re.compile(L + r"(?:AKIA|ASIA)[A-Z0-9]{16}" + R), None),
+    (re.compile(L + r"xox[abprs]-[A-Za-z0-9-]{10,}"), None),
+    (re.compile(L + r"AIza[A-Za-z0-9_-]{35}"), None),
+    (re.compile(L + r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*"), None),
+    (re.compile(r"(?<![A-Za-z0-9_])[Bb]earer[ \t]+(?P<secret>[A-Za-z0-9._~+/-]{16,}=*)"), "digit"),
+    (re.compile(r"(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*://[^\s/:@]+:(?P<secret>[^\s/@]+)@", re.I), None),
+    (re.compile(r"(?<![\w-])(?P<name>[\w-]*?(?:password|passwd|пароль|token|secret|key|ключ))[\"']?[ \t]*(?P<sep>=|:)[ \t]*[\"']?(?P<secret>[\x21-\x7e]+?)(?=[\"'`,;&<>)\]}]|\s|$)", re.I), accept_assigned_secret),
+]
+
+def line_has_secret(line):
+    for pattern, accept in SECRET_PATTERNS:
+        for match in pattern.finditer(line):
+            value = match.groupdict().get("secret") or match.group(0)
+            if accept is None:
+                return True
+            if accept == "digit" and re.search(r"[0-9]", value):
+                return True
+            if callable(accept) and accept(value, match):
+                return True
+    return False
+
+def pretty_path(path, home):
+    path = os.path.abspath(path)
+    if path == home:
+        return "~"
+    if path.startswith(home + os.sep):
+        return "~/" + path[len(home) + 1:].replace(os.sep, "/")
+    return path
+
+def pretty_size(size):
+    if size < 1024:
+        return "%d Б" % size
+    if size < 1024 * 1024:
+        return "%d КБ" % int(size / 1024 + 0.5)
+    tenths = int(size * 10 / (1024 * 1024) + 0.5)
+    return "%d,%d МБ" % (tenths // 10, tenths % 10)
+
+def pretty_count(count, words=("файл", "файла", "файлов")):
+    mod10 = count % 10
+    mod100 = count % 100
+    if mod10 == 1 and mod100 != 11:
+        word = words[0]
+    elif 2 <= mod10 <= 4 and not 12 <= mod100 <= 14:
+        word = words[1]
+    else:
+        word = words[2]
+    return "%d %s" % (count, word)
+
+def skip_reason(name):
+    lower = name.lower()
+    if lower.startswith(".env") or lower.startswith("id_") or any(word in lower for word in ("secret", "credential", "token")):
+        return "похоже на ключи"
+    if lower.endswith((".pem", ".key", ".p12", ".pfx")):
+        return "похоже на ключи"
+    if not lower.endswith((".md", ".markdown", ".txt")):
+        return "не текст"
+    return None
+
+def inspect_memory_file(path, home, skipped, secrets):
+    name = os.path.basename(path)
+    shown = pretty_path(path, home)
+    if os.path.islink(path):
+        skipped.append((shown, "симлинк"))
+        return None
+    reason = skip_reason(name)
+    if reason:
+        skipped.append((shown, reason))
+        return None
+    try:
+        size = os.path.getsize(path)
+        if size > 256 * 1024:
+            skipped.append((shown, "больше 256 КБ"))
+            return None
+        with open(path, "rb") as source:
+            data = source.read()
+        if b"\0" in data[:8192]:
+            skipped.append((shown, "не текст"))
+            return None
+        text = data.decode("utf-8", "replace")
+        in_private_key = False
+        for number, line in enumerate(text.splitlines(), 1):
+            begins = re.search(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----", line)
+            ends = re.search(r"-----END [A-Z0-9 ]*PRIVATE KEY-----", line)
+            if in_private_key or begins or line_has_secret(line):
+                secrets.append((shown, number))
+            if in_private_key and ends:
+                in_private_key = False
+            if begins and not ends:
+                in_private_key = True
+        return size
+    except Exception:
+        skipped.append((shown, "не прочитал"))
+        return None
+
+def walk_memory_dir(root, home, skipped, secrets):
+    count = 0
+    total = 0
+    try:
+        entries = sorted(os.scandir(root), key=lambda entry: entry.name)
+    except Exception:
+        skipped.append((pretty_path(root, home), "не прочитал"))
+        return count, total
+    for entry in entries:
+        path = entry.path
+        shown = pretty_path(path, home)
+        try:
+            if entry.is_symlink():
+                skipped.append((shown, "симлинк"))
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                if entry.name.startswith("."):
+                    skipped.append((shown + "/", "скрытая папка"))
+                elif entry.name == "node_modules":
+                    skipped.append((shown + "/", "node_modules"))
+                else:
+                    subcount, subtotal = walk_memory_dir(path, home, skipped, secrets)
+                    count += subcount
+                    total += subtotal
+                continue
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            if entry.name in ("CLAUDE.md", "AGENTS.md"):
+                skipped.append((shown, "правила команды"))
+                continue
+            size = inspect_memory_file(path, home, skipped, secrets)
+            if size is not None:
+                count += 1
+                total += size
+        except Exception:
+            skipped.append((shown, "не прочитал"))
+    return count, total
+
+def custom_memory_dirs(home):
+    dirs = []
+    seen = set()
+    for raw in os.environ.get("TASKLESS_MEMORY_DIRS", "").splitlines():
+        if not raw:
+            continue
+        path = os.path.abspath(os.path.expanduser(raw))
+        if path in seen:
+            continue
+        seen.add(path)
+        dirs.append((path, raw))
+    return dirs
+
+def validate_memory_dirs():
+    home = os.path.abspath(os.environ.get("HOME", ""))
+    for path, raw in custom_memory_dirs(home):
+        if not os.path.isdir(path):
+            raise ValueError("Нет такой папки: %s" % raw)
+
+def secret_ranges(secrets):
+    ranges = []
+    for path, number in secrets:
+        if ranges and ranges[-1][0] == path and ranges[-1][2] == number - 1:
+            ranges[-1][2] = number
+        else:
+            ranges.append([path, number, number])
+    return ranges
+
+def memory_scan(output):
+    home = os.path.abspath(os.environ.get("HOME", ""))
+    validate_memory_dirs()
+    files = [
+        (os.path.join(home, ".claude", "CLAUDE.md"), "правила"),
+        (os.path.join(home, ".codex", "AGENTS.md"), "правила"),
+    ]
+    claude_dirs = []
+    projects = os.path.join(home, ".claude", "projects")
+    try:
+        for entry in sorted(os.scandir(projects), key=lambda item: item.name):
+            memory = os.path.join(entry.path, "memory")
+            if not entry.is_symlink() and entry.is_dir(follow_symlinks=False) and os.path.isdir(memory) and not os.path.islink(memory):
+                claude_dirs.append(memory)
+    except Exception:
+        pass
+    dirs = [(os.path.join(home, ".codex", name), "память Codex") for name in ("memories", "memories_v2")]
+    dirs += [(path, "твоя папка") for path, raw in custom_memory_dirs(home)]
+    rows = []
+    skipped = []
+    secrets = []
+    total = 0
+    for path, label in files:
+        if os.path.exists(path) or os.path.islink(path):
+            size = inspect_memory_file(path, home, skipped, secrets)
+            if size is not None:
+                rows.append("  %s — %s, %s" % (pretty_path(path, home), pretty_size(size), label))
+                total += size
+    claude_count = 0
+    claude_size = 0
+    for path in claude_dirs:
+        count, size = walk_memory_dir(path, home, skipped, secrets)
+        claude_count += count
+        claude_size += size
+    if claude_count:
+        rows.append("  ~/.claude/projects/…/memory/ — %s, %s, память Claude Code" % (pretty_count(claude_count), pretty_size(claude_size)))
+        total += claude_size
+    for path, label in dirs:
+        if not os.path.exists(path) and not os.path.islink(path):
+            continue
+        if os.path.islink(path):
+            skipped.append((pretty_path(path, home), "симлинк"))
+            continue
+        count, size = walk_memory_dir(path, home, skipped, secrets)
+        if count:
+            rows.append("  %s/ — %s, %s, %s" % (pretty_path(path, home), pretty_count(count), pretty_size(size), label))
+            total += size
+    lines = list(rows)
+    if rows:
+        lines.append("Всего %s. Агент за раз читает до 200 КБ, остальное — по выбору человека." % pretty_size(total))
+    if skipped:
+        skipped_text = "; ".join("%s — %s" % item for item in skipped[:10])
+        if len(skipped) > 10:
+            skipped_text += "; и ещё %d" % (len(skipped) - 10)
+        lines.append("Пропущены: " + skipped_text + ".")
+    for path, first, last in secret_ranges(secrets):
+        if first == last:
+            lines.append("Похоже на секрет: %s, строка %d. Эту строку в записи не бери." % (path, first))
+        else:
+            lines.append("Похоже на секрет: %s, строки %d–%d. Эти строки в записи не бери." % (path, first, last))
+    with open(output, "w", encoding="utf-8") as report:
+        report.write("\n".join(lines) + ("\n" if lines else ""))
+    emit_memory_field("memory_found", 1 if rows else 0)
+
+IMPORT_KINDS = {"fact", "rule", "decision", "promise"}
+IMPORT_SOURCES = {"instructions", "agent_memory", "notes"}
+IMPORT_CLIENTS = {"claude-code", "codex", "grok", "zcode", "cursor", "gemini", "other"}
+IMPORT_MODIFIED_AT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$")
+
+def valid_modified_at(value):
+    if not isinstance(value, str) or not IMPORT_MODIFIED_AT.match(value):
+        return False
+    try:
+        datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return True
+    except ValueError:
+        return False
+
+def read_import_batch(path):
+    try:
+        with open(path, encoding="utf-8") as source:
+            batch = json.load(source)
+    except Exception as err:
+        raise ValueError("Не прочитал JSON %s: %s" % (path, err))
+    if not isinstance(batch, dict) or not isinstance(batch.get("files"), list):
+        raise ValueError("Не тот формат %s: нужен объект с массивом files" % path)
+    if "client" in batch and batch["client"] not in IMPORT_CLIENTS:
+        raise ValueError("Не тот формат %s: неизвестный client" % path)
+    for file_index, file in enumerate(batch["files"], 1):
+        where = "файл %d" % file_index
+        if not isinstance(file, dict):
+            raise ValueError("%s: нужен объект" % where)
+        if not isinstance(file.get("path"), str) or not 1 <= len(file["path"]) <= 500:
+            raise ValueError("%s: path — строка от 1 до 500 знаков" % where)
+        if file.get("source") not in IMPORT_SOURCES:
+            raise ValueError("%s: source — instructions, agent_memory или notes" % where)
+        if "modifiedAt" in file and not valid_modified_at(file["modifiedAt"]):
+            raise ValueError("%s: modifiedAt — дата ISO 8601 с часовым поясом" % where)
+        if not isinstance(file.get("items"), list):
+            raise ValueError("%s: items — массив записей" % where)
+        if len(file["items"]) > 300:
+            raise ValueError("%s: больше 300 записей, раздели их между файлами" % where)
+        for item_index, item in enumerate(file["items"], 1):
+            place = "%s, запись %d" % (where, item_index)
+            if not isinstance(item, dict) or not isinstance(item.get("statement"), str):
+                raise ValueError("%s: statement — строка" % place)
+            if "kind" in item and item["kind"] not in IMPORT_KINDS:
+                raise ValueError("%s: kind — fact, rule, decision или promise" % place)
+            if "quote" in item and not isinstance(item["quote"], str):
+                raise ValueError("%s: quote — строка" % place)
+    if sum(len(file["items"]) for file in batch["files"]) == 0:
+        raise ValueError("Пустая пачка %s: нужна хотя бы одна запись" % path)
+    return batch
+
+def import_batches(batch):
+    batches = []
+    current = []
+    count = 0
+    for file in batch["files"]:
+        size = len(file["items"])
+        if current and count + size > 300:
+            batches.append(current)
+            current = []
+            count = 0
+        current.append(file)
+        count += size
+    if current:
+        batches.append(current)
+    return batches
+
+def write_import_report(output, reports, dry_files=None):
+    if dry_files is not None:
+        total_items = sum(len(file["items"]) for file in dry_files)
+        lines = ["Проверка: ушло бы %s, запросов не отправил." % pretty_count(total_items, ("запись", "записи", "записей"))]
+        lines += ["  %s — %s" % (file["path"], pretty_count(len(file["items"]), ("запись", "записи", "записей"))) for file in dry_files]
+    else:
+        total = {key: sum(int(report.get(key, 0)) for report in reports) for key in ("new", "known", "duplicate", "skipped")}
+        lines = ["Взял новых: %d. Уже было: %d. Повтор: %d. Пропущено: %d" % (total["new"], total["known"], total["duplicate"], total["skipped"])]
+        reason_names = [("secret", "секрет"), ("too_long", "длиннее 300 знаков"), ("empty", "пусто"), ("rule_without_quote", "правило без цитаты"), ("retracted", "ты это раньше удалил"), ("error", "ошибка")]
+        reasons = []
+        for key, label in reason_names:
+            count = sum(int((report.get("skippedByReason") or {}).get(key, 0)) for report in reports)
+            if count:
+                reasons.append("%s — %d" % (label, count))
+        if reasons:
+            lines.append("Причины пропусков: " + "; ".join(reasons))
+        for report in reports:
+            for file in report.get("files") or []:
+                lines.append("  %s — новых %d, уже было %d, повтор %d, пропущено %d" % (file.get("file", ""), int(file.get("new", 0)), int(file.get("known", 0)), int(file.get("duplicate", 0)), int(file.get("skipped", 0))))
+    with open(output, "w", encoding="utf-8") as target:
+        # Путь из ответа сервера может нести одиночный суррогат. В отчёте,
+        # как у node, он становится U+FFFD, иначе запись utf-8 падает.
+        target.write(re.sub("[\ud800-\udfff]", "\ufffd", "\n".join(lines)) + "\n")
+
+def memory_import(path, output, dry):
+    batch = read_import_batch(path)
+    if dry:
+        write_import_report(output, [], batch["files"])
+        return
+    reports = []
+    sent = 0
+    total_items = sum(len(file["items"]) for file in batch["files"])
+    for files in import_batches(batch):
+        payload = {"files": files}
+        if "client" in batch:
+            payload["client"] = batch["client"]
+        status, retry, net, body = request("POST", base() + "/memory/personal/import", payload, os.environ.get("TASKLESS_TOKEN", ""))
+        if status != 200:
+            if reports:
+                write_import_report(output, reports)
+                with open(output, "a", encoding="utf-8") as target:
+                    target.write("Отправил %d из %s, дальше остановился:\n" % (sent, pretty_count(total_items, ("запись", "записи", "записей"))))
+            raise ValueError(server_message(body, net))
+        reports.append(body)
+        sent += sum(len(file["items"]) for file in files)
+    write_import_report(output, reports)
+
 def main():
     cmd = sys.argv[1]
     if cmd == "device_start":
@@ -653,10 +1452,41 @@ def main():
         else:
             sys.stderr.write("edit: не знаю действие\n")
             sys.exit(1)
+    elif cmd == "json":
+        action, path, dry = sys.argv[2:5]
+        if action == "apply":
+            json_apply(path, dry == "1")
+        elif action == "remove":
+            json_remove(path, dry == "1")
+        elif action == "status":
+            json_status(path)
+        else:
+            sys.stderr.write("json: не знаю действие\n")
+            sys.exit(1)
+    elif cmd == "toml_block":
+        toml_block()
     elif cmd == "meta_write":
         meta_write()
     elif cmd == "meta_read":
         meta_read()
+    elif cmd == "memory_state":
+        memory_state()
+    elif cmd == "memory_set":
+        memory_set(sys.argv[2])
+    elif cmd == "memory_validate_dirs":
+        try:
+            validate_memory_dirs()
+        except ValueError as err:
+            sys.stderr.write(str(err) + "\n")
+            sys.exit(1)
+    elif cmd == "memory_scan":
+        memory_scan(sys.argv[2])
+    elif cmd == "memory_import":
+        try:
+            memory_import(sys.argv[2], sys.argv[3], sys.argv[4] == "1")
+        except ValueError as err:
+            sys.stderr.write(str(err) + "\n")
+            sys.exit(1)
     else:
         sys.stderr.write("не знаю команду\n")
         sys.exit(1)
@@ -668,7 +1498,7 @@ TASKLESS_CONNECT_PY_END
     HELPER="$raw.mjs"
     mv "$raw" "$HELPER"
     cat > "$HELPER" <<'TASKLESS_CONNECT_NODE_END'
-import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync, unlinkSync, statSync, lstatSync, readlinkSync, openSync, closeSync, fchmodSync, writeSync, renameSync } from "node:fs";
+import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, chmodSync, unlinkSync, statSync, lstatSync, readlinkSync, openSync, closeSync, fchmodSync, writeSync, renameSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import { request as httpRequest } from "node:http";
@@ -807,7 +1637,7 @@ function findLine(data, needle, start) {
   return -1;
 }
 
-// Строка-метка с \n или \r\n: файл могли пересохранить с CRLF. Ближняя из двух.
+// Строка-метка с \n, \r\n или в конце файла без перевода. Ближняя из трёх.
 function findMark(data, mark, start) {
   let best = { pos: -1, len: 0 };
   for (const nl of ["\n", "\r\n"]) {
@@ -815,6 +1645,9 @@ function findMark(data, mark, start) {
     const i = findLine(data, needle, start);
     if (i >= 0 && (best.pos < 0 || i < best.pos)) best = { pos: i, len: needle.length };
   }
+  const needle = Buffer.from(mark);
+  const i = findLine(data, needle, start);
+  if (i >= 0 && i + needle.length === data.length && (best.pos < 0 || i < best.pos)) best = { pos: i, len: needle.length };
   return best;
 }
 
@@ -860,6 +1693,233 @@ function emitEdit(changed, backup, created, deleted) {
   process.stdout.write(`deleted=${deleted ? 1 : 0}\n`);
 }
 
+function tomlKey(raw) {
+  return raw.trim().replace(/[ \t]+/g, "").replaceAll('"taskless"', "taskless").replaceAll("'taskless'", "taskless");
+}
+
+function tomlKind(key) {
+  if (key === "mcp_servers.taskless" || key.startsWith("mcp_servers.taskless.")) return "mcp";
+  const plugin = 'plugins."taskless@taskless-app".mcp_servers.taskless';
+  if (key === plugin || key.startsWith(plugin + ".")) return "plugin";
+  return null;
+}
+
+function tomlHeader(line) {
+  const array = line.match(/^[ \t]*\[\[([^\[\]]+)\]\][ \t]*(?:#.*)?(?:\r?\n)?$/);
+  if (array) return "[]" + tomlKey(array[1]);
+  const match = line.match(/^[ \t]*\[([^\[\]]+)\][ \t]*(?:#.*)?(?:\r?\n)?$/);
+  return match ? tomlKey(match[1]) : null;
+}
+
+function tomlMask(data) {
+  const out = Buffer.from(data);
+  let state = "";
+  let i = 0;
+  while (i < data.length) {
+    const char = data[i];
+    if (state === "basic" || state === "literal") {
+      if (state === "basic" && char === 92) {
+        i += 2;
+        continue;
+      }
+      if (char === (state === "basic" ? 34 : 39) || char === 10) state = "";
+      i += 1;
+      continue;
+    }
+    if (state === "basic3" || state === "literal3") {
+      const delimiter = state === "basic3" ? '"""' : "'''";
+      if (data.subarray(i, i + 3).toString("utf8") === delimiter) {
+        state = "";
+        i += 3;
+        continue;
+      }
+      if (state === "basic3" && char === 92) {
+        out[i] = 32;
+        if (i + 1 < data.length && data[i + 1] !== 10 && data[i + 1] !== 13) out[i + 1] = 32;
+        i += 2;
+        continue;
+      }
+      if (char !== 10 && char !== 13) out[i] = 32;
+      i += 1;
+      continue;
+    }
+    if (char === 35) {
+      const nl = data.indexOf(0x0a, i);
+      i = nl < 0 ? data.length : nl;
+      continue;
+    }
+    if (char === 34 || char === 39) {
+      const delimiter = char === 34 ? '"""' : "'''";
+      if (data.subarray(i, i + 3).toString("utf8") === delimiter) {
+        state = char === 34 ? "basic3" : "literal3";
+        i += 3;
+      } else {
+        state = char === 34 ? "basic" : "literal";
+        i += 1;
+      }
+      continue;
+    }
+    i += 1;
+  }
+  return { masked: out, open: state };
+}
+
+function tomlAssignmentEnd(masked, pos, nextPos) {
+  let balance = 0;
+  let scan = pos;
+  let first = true;
+  while (scan < masked.length) {
+    const line = masked.subarray(scan, nextPos).toString("utf8");
+    const eq = first ? line.indexOf("=") : -1;
+    const rhs = (eq >= 0 ? line.slice(eq + 1) : line).replace(/"(?:\\.|[^"\\])*"|'[^']*'/g, "").split("#", 1)[0];
+    for (const char of rhs) {
+      if (char === "[" || char === "{") balance += 1;
+      if (char === "]" || char === "}") balance -= 1;
+    }
+    if (balance <= 0) return nextPos;
+    first = false;
+    scan = nextPos;
+    const nl = masked.indexOf(0x0a, scan);
+    nextPos = nl < 0 ? masked.length : nl + 1;
+  }
+  return masked.length;
+}
+
+function tomlTasklessRanges(data) {
+  const { masked } = tomlMask(data);
+  const ranges = [];
+  let section = "";
+  let pos = 0;
+  while (pos < data.length) {
+    const nl = data.indexOf(0x0a, pos);
+    const nextPos = nl < 0 ? data.length : nl + 1;
+    const line = masked.subarray(pos, nextPos).toString("utf8");
+    const header = tomlHeader(line);
+    if (header !== null) {
+      section = header;
+      const kind = tomlKind(section);
+      if (kind) {
+        const start = pos;
+        let end = data.length;
+        let scan = nextPos;
+        while (scan < data.length) {
+          const scanNl = data.indexOf(0x0a, scan);
+          const scanNext = scanNl < 0 ? data.length : scanNl + 1;
+          const nextHeader = tomlHeader(masked.subarray(scan, scanNext).toString("utf8"));
+          if (nextHeader !== null && !nextHeader.startsWith(section + ".")) {
+            end = scan;
+            break;
+          }
+          scan = scanNext;
+        }
+        ranges.push({ start, end, kind });
+        pos = end;
+        continue;
+      }
+    } else {
+      const eq = line.indexOf("=");
+      if (eq >= 0) {
+        const full = (section ? section + "." : "") + tomlKey(line.slice(0, eq));
+        const kind = tomlKind(full);
+        if (kind) {
+          const end = tomlAssignmentEnd(masked, pos, nextPos);
+          ranges.push({ start: pos, end, kind });
+          pos = end;
+          continue;
+        }
+      }
+    }
+    pos = nextPos;
+  }
+  return ranges;
+}
+
+function tomlRemoveRanges(data, ranges) {
+  const parts = [];
+  let pos = 0;
+  for (const range of [...ranges].sort((a, b) => a.start - b.start)) {
+    parts.push(data.subarray(pos, range.start));
+    pos = range.end;
+  }
+  parts.push(data.subarray(pos));
+  return Buffer.concat(parts);
+}
+
+function tomlRestoreAnchor(bak, pos, ranges) {
+  const { masked } = tomlMask(bak);
+  while (pos < bak.length) {
+    const inside = ranges.find((range) => range.start <= pos && pos < range.end);
+    if (inside) {
+      pos = inside.end;
+      continue;
+    }
+    const nl = bak.indexOf(0x0a, pos);
+    const nextPos = nl < 0 ? bak.length : nl + 1;
+    const header = tomlHeader(masked.subarray(pos, nextPos).toString("utf8"));
+    if (header !== null) return header;
+    pos = nextPos;
+  }
+  return null;
+}
+
+function tomlFindHeader(data, wanted) {
+  const { masked } = tomlMask(data);
+  let pos = 0;
+  while (pos < data.length) {
+    const nl = data.indexOf(0x0a, pos);
+    const nextPos = nl < 0 ? data.length : nl + 1;
+    if (tomlHeader(masked.subarray(pos, nextPos).toString("utf8")) === wanted) return pos;
+    pos = nextPos;
+  }
+  return data.length;
+}
+
+function tomlRestoreRanges(stripped, bak, ranges) {
+  const base = tomlRemoveRanges(bak, ranges);
+  const withNl = Buffer.concat([base, Buffer.from("\n")]);
+  if (stripped.equals(base) || (base[base.length - 1] !== 0x0a && stripped.equals(withNl))) return bak;
+  let next = stripped;
+  for (const range of [...ranges].sort((a, b) => a.start - b.start)) {
+    const anchor = tomlRestoreAnchor(bak, range.end, ranges);
+    const at = anchor === null ? next.length : tomlFindHeader(next, anchor);
+    if (anchor !== null && at === next.length) {
+      const label = anchor.startsWith("[]") ? `[[${anchor.slice(2)}]]` : anchor;
+      process.stderr.write(`Предупреждение: заголовок ${label} не найден, восстанавливаю taskless в конец TOML.\n`);
+    }
+    const sep = at > 0 && next[at - 1] !== 0x0a ? Buffer.from(next.includes(Buffer.from("\r\n")) ? "\r\n" : "\n") : Buffer.alloc(0);
+    next = Buffer.concat([next.subarray(0, at), sep, bak.subarray(range.start, range.end), next.subarray(at)]);
+  }
+  return next;
+}
+
+function tomlValidate(path, data, installed = true) {
+  const { masked, open } = tomlMask(data);
+  if (open) {
+    process.stderr.write(`Не смог разобрать итоговый TOML ${path}: незакрытая строка. Файл не меняю.\n`);
+    process.exit(1);
+  }
+  if (!installed) return;
+  const counts = { mcp: 0, plugin: 0 };
+  for (const range of tomlTasklessRanges(data)) counts[range.kind] += 1;
+  let rootInline = false;
+  let pos = 0;
+  while (pos < masked.length) {
+    const nl = masked.indexOf(0x0a, pos);
+    const nextPos = nl < 0 ? masked.length : nl + 1;
+    const line = masked.subarray(pos, nextPos).toString("utf8");
+    if (tomlHeader(line) !== null) break;
+    if (/^[ \t]*mcp_servers[ \t]*=[ \t]*\{/.test(line)) {
+      rootInline = true;
+      break;
+    }
+    pos = nextPos;
+  }
+  if (counts.mcp !== 1 || counts.plugin !== 1 || rootInline) {
+    process.stderr.write(`В итоговом TOML ${path} дублируется taskless. Файл не меняю.\n`);
+    process.exit(1);
+  }
+}
+
 function applyBlock(path, begin, end, inner, dry, mode) {
   const beginB = Buffer.from(begin + "\n");
   const endB = Buffer.from(end + "\n");
@@ -874,8 +1934,10 @@ function applyBlock(path, begin, end, inner, dry, mode) {
   } else {
     const b = findMark(old, begin, 0);
     if (b.pos < 0) {
-      const sep = old.length === 0 || old[old.length - 1] === 0x0a ? Buffer.alloc(0) : Buffer.from("\n");
-      next = Buffer.concat([old, sep, block]);
+      const ranges = begin === "# >>> taskless:codex" ? tomlTasklessRanges(old) : [];
+      const base = ranges.length ? tomlRemoveRanges(old, ranges) : old;
+      const sep = base.length === 0 || base[base.length - 1] === 0x0a ? Buffer.alloc(0) : Buffer.from("\n");
+      next = Buffer.concat([base, sep, block]);
     } else {
       const e = findMark(old, end, b.pos + b.len);
       if (e.pos < 0) {
@@ -890,6 +1952,7 @@ function applyBlock(path, begin, end, inner, dry, mode) {
     emitEdit(false, "", false, false);
     return;
   }
+  if (begin === "# >>> taskless:codex" && inner.includes(Buffer.from("[mcp_servers.taskless]"))) tomlValidate(path, next);
   const bak = path + ".bak-taskless";
   let backup = "";
   if (old !== null && !existsSync(bak)) backup = bak;
@@ -926,10 +1989,12 @@ function removeBlock(path, begin, end, dry) {
   const stripped = Buffer.concat([old.subarray(0, b.pos), old.subarray(e.pos + e.len)]);
   const bakPath = path + ".bak-taskless";
   const bak = existsSync(bakPath) && statSync(bakPath).isFile() ? readFileSync(bakPath) : null;
-  let next = stripped;
+  const original = bak && begin === "# >>> taskless:codex" ? tomlTasklessRanges(bak) : [];
+  let next = original.length ? tomlRestoreRanges(stripped, bak, original) : stripped;
   if (bak && (stripped.equals(bak) || (stripped.equals(Buffer.concat([bak, Buffer.from("\n")])) && bak[bak.length - 1] !== 0x0a))) {
     next = bak;
   }
+  if (begin === "# >>> taskless:codex") tomlValidate(path, next, false);
   if (dry) {
     // Пустую копию возвращаем пустым файлом, а не удалением.
     emitEdit(true, "", false, next.length === 0 && !bak);
@@ -944,6 +2009,138 @@ function removeBlock(path, begin, end, dry) {
   }
   if (bak && next.equals(bak) && existsSync(bakPath)) unlinkSync(bakPath);
   emitEdit(true, "", false, deleted);
+}
+
+function jsonParse(raw, path) {
+  if (!raw || !raw.toString("utf8").trim()) return {};
+  let data;
+  try {
+    data = JSON.parse(raw.toString("utf8"));
+  } catch {
+    process.stderr.write(`Не смог разобрать JSON ${path}. Файл не меняю.\n`);
+    process.exit(1);
+  }
+  if (!data || Array.isArray(data) || typeof data !== "object") {
+    process.stderr.write(`В JSON ${path} жду объект в корне. Файл не меняю.\n`);
+    process.exit(1);
+  }
+  return data;
+}
+
+function jsonRead(path) {
+  const raw = existsSync(path) && statSync(path).isFile() ? readFileSync(path) : null;
+  return { raw, data: jsonParse(raw, path) };
+}
+
+function jsonServer() {
+  return {
+    type: "http",
+    url: process.env.TASKLESS_MCP_URL || "",
+    headersHelper: process.env.TASKLESS_HEADER_COMMAND || "",
+  };
+}
+
+function jsonTasklessOwned(server) {
+  if (!server || Array.isArray(server) || typeof server !== "object" || typeof server.headersHelper !== "string") return false;
+  const helperPath = `${process.env.HOME}/.config/taskless/mcp-headers`;
+  return server.headersHelper.includes(helperPath);
+}
+
+function jsonDump(data) {
+  return Buffer.from(JSON.stringify(data, null, 2) + "\n", "utf8");
+}
+
+function sameJson(a, b) {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function jsonApply(path, dry) {
+  const { raw, data } = jsonRead(path);
+  let servers = data.mcpServers;
+  if (servers === undefined) {
+    servers = {};
+    data.mcpServers = servers;
+  }
+  if (!servers || Array.isArray(servers) || typeof servers !== "object") {
+    process.stderr.write(`В JSON ${path} ключ mcpServers не объект. Файл не меняю.\n`);
+    process.exit(1);
+  }
+  const wanted = jsonServer();
+  if (sameJson(servers.taskless, wanted)) {
+    emitEdit(false, "", false, false);
+    return;
+  }
+  servers.taskless = wanted;
+  const bak = path + ".bak-taskless";
+  const backup = raw !== null && !existsSync(bak) ? bak : "";
+  if (dry) {
+    emitEdit(true, backup, raw === null, false);
+    return;
+  }
+  if (backup) {
+    mkdirSync(dirname(path) || ".", { recursive: true });
+    writeFileSync(bak, raw);
+    chmodSync(bak, statSync(path).mode & 0o777);
+  }
+  writeAtomic(path, jsonDump(data), raw === null ? 0o600 : statSync(path).mode & 0o777);
+  emitEdit(true, backup, raw === null, false);
+}
+
+function jsonRemove(path, dry) {
+  if (!existsSync(path) || !statSync(path).isFile()) {
+    emitEdit(false, "", false, false);
+    return;
+  }
+  const { data } = jsonRead(path);
+  const servers = data.mcpServers;
+  if (!servers || typeof servers !== "object" || !jsonTasklessOwned(servers.taskless)) {
+    emitEdit(false, "", false, false);
+    return;
+  }
+  const bakPath = path + ".bak-taskless";
+  const bakRaw = existsSync(bakPath) && statSync(bakPath).isFile() ? readFileSync(bakPath) : null;
+  const bakData = bakRaw === null ? null : jsonParse(bakRaw, bakPath);
+  delete servers.taskless;
+  const bakServers = bakData?.mcpServers;
+  if (bakServers && typeof bakServers === "object" && Object.hasOwn(bakServers, "taskless")) {
+    servers.taskless = bakServers.taskless;
+  }
+  if (Object.keys(servers).length === 0 && (!bakData || !bakData.mcpServers || Object.keys(bakData.mcpServers).length === 0)) {
+    delete data.mcpServers;
+  }
+  if (dry) {
+    emitEdit(true, "", false, bakData === null && Object.keys(data).length === 0);
+    return;
+  }
+  let deleted = false;
+  if (bakData === null && Object.keys(data).length === 0) {
+    unlinkSync(linkDest(path));
+    deleted = true;
+  } else if (bakRaw !== null && sameJson(data, bakData)) {
+    writeAtomic(path, bakRaw, statSync(path).mode & 0o777);
+  } else {
+    writeAtomic(path, jsonDump(data), statSync(path).mode & 0o777);
+  }
+  if (bakRaw !== null) unlinkSync(bakPath);
+  emitEdit(true, "", false, deleted);
+}
+
+function jsonStatus(path) {
+  if (!existsSync(path) || !statSync(path).isFile()) {
+    emitEdit(false, "", false, false);
+    return;
+  }
+  const { data } = jsonRead(path);
+  const connected = data.mcpServers && typeof data.mcpServers === "object" && jsonTasklessOwned(data.mcpServers.taskless);
+  emitEdit(Boolean(connected), "", false, false);
+}
+
+function tomlBlock() {
+  process.stdout.write("[mcp_servers.taskless]\n");
+  process.stdout.write(`url = ${JSON.stringify(process.env.TASKLESS_MCP_URL || "")}\n`);
+  process.stdout.write(`http_headers_helper = ${JSON.stringify(process.env.TASKLESS_HEADER_COMMAND || "")}\n\n`);
+  process.stdout.write('[plugins."taskless@taskless-app".mcp_servers.taskless]\n');
+  process.stdout.write("enabled = false\n");
 }
 
 function metaWrite() {
@@ -983,6 +2180,410 @@ function metaRead() {
   process.stdout.write(`agents=${agents.map((a) => String(a)).join(",")}\n`);
 }
 
+function emitMemoryField(key, value) {
+  process.stdout.write(`${key}=${field(value)}\n`);
+}
+
+function serverMessage(payload, net = "") {
+  if (net) return net;
+  if (payload && typeof payload === "object") {
+    for (const key of ["message", "error", "detail"]) {
+      if (typeof payload[key] === "string" && payload[key]) return payload[key];
+    }
+  }
+  return "неизвестная ошибка сервера";
+}
+
+async function memoryState() {
+  const r = await request("GET", apiBase() + "/memory/personal/settings", null, process.env.TASKLESS_TOKEN || "");
+  emitMemoryField("status", r.status);
+  emitMemoryField("net_error", r.net);
+  emitMemoryField("memory_state", ["on", "off"].includes(r.payload.state) ? r.payload.state : "");
+  emitMemoryField("server_message", r.status === 200 ? "" : serverMessage(r.payload, r.net));
+}
+
+async function memorySet(value) {
+  const r = await request("PUT", apiBase() + "/memory/personal/settings", { enabled: value === "on" }, process.env.TASKLESS_TOKEN || "");
+  if (r.status !== 200) throw new Error(serverMessage(r.payload, r.net));
+  emitMemoryField("status", r.status);
+}
+
+const SECRET_WORDS = new Set(["password", "passwd", "пароль", "token", "secret", "apikey", "ключ"]);
+const SECRET_KEY_OWNERS = new Set(["api", "secret", "access"]);
+const SECRET_PLACEHOLDER = /^(?:true|false|null|none|undefined|empty|redacted|x+|\*+|\.+)$/i;
+const NOT_SECRET_VALUE = /^(?:@?[A-Z][A-Z0-9]*-\d+|v?\d+(?:\.\d+)+(?:[-+][\w.]+)?|\d{4}-\d{2}-\d{2}(?:[T ]?[\d:.]+Z?)?|\d{1,2}:\d{2}(?::\d{2})?)$/;
+
+function isSecretName(name) {
+  const words = name
+    .replace(/(\p{Ll}|\p{N})(\p{Lu})/gu, "$1_$2")
+    .replace(/(\p{Lu})(\p{Lu}\p{Ll})/gu, "$1_$2")
+    .toLowerCase()
+    .split(/[_-]+/)
+    .filter(Boolean);
+  const last = words.at(-1);
+  if (!last) return false;
+  if (SECRET_WORDS.has(last)) return true;
+  return last === "key" && words.length > 1 && SECRET_KEY_OWNERS.has(words.at(-2));
+}
+
+function acceptAssignedSecret(value, match) {
+  if (!isSecretName(match.groups.name)) return false;
+  if (SECRET_PLACEHOLDER.test(value) || /^[$%{<]/.test(value) || /^process\.env\b/.test(value)) return false;
+  if (NOT_SECRET_VALUE.test(value)) return false;
+  if (match.groups.sep === "=") return value.length >= 4;
+  return value.length >= 6 && /[^\p{L}]/u.test(value);
+}
+
+const L = String.raw`(?<![A-Za-z0-9_])`;
+const R = String.raw`(?![A-Za-z0-9_])`;
+const SECRET_PATTERNS = [
+  [/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/g, null],
+  [new RegExp(`${L}(?:tlswarm|tldev|tlsec|tldc|tla|tlr|tlc)_[A-Za-z0-9_-]{20,}`, "g"), null],
+  [new RegExp(`${L}gh[pousr]_[A-Za-z0-9]{30,}${R}`, "g"), null],
+  [new RegExp(`${L}github_pat_[A-Za-z0-9_]{22,}`, "g"), null],
+  [new RegExp(`${L}sk-ant-[A-Za-z0-9_-]{20,}`, "g"), null],
+  [new RegExp(`${L}sk-[A-Za-z0-9_-]{20,}`, "g"), "digit"],
+  [new RegExp(`${L}(?:AKIA|ASIA)[A-Z0-9]{16}${R}`, "g"), null],
+  [new RegExp(`${L}xox[abprs]-[A-Za-z0-9-]{10,}`, "g"), null],
+  [new RegExp(`${L}AIza[A-Za-z0-9_-]{35}`, "g"), null],
+  [new RegExp(`${L}eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]*`, "g"), null],
+  [/(?<![A-Za-z0-9_])[Bb]earer[ \t]+(?<secret>[A-Za-z0-9._~+/-]{16,}=*)/g, "digit"],
+  [/(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*:\/\/[^\s\/:@]+:(?<secret>[^\s\/@]+)@/gi, null],
+  [/(?<![\p{L}\p{N}_-])(?<name>[\p{L}\p{N}_-]*?(?:password|passwd|пароль|token|secret|key|ключ))["']?[ \t]*(?<sep>=|:)[ \t]*["']?(?<secret>[\x21-\x7e]+?)(?=["'`,;&<>)\]}]|\s|$)/giu, acceptAssignedSecret],
+];
+
+function lineHasSecret(line) {
+  for (const [pattern, accept] of SECRET_PATTERNS) {
+    pattern.lastIndex = 0;
+    for (const match of line.matchAll(pattern)) {
+      const value = match.groups?.secret || match[0];
+      if (accept === null) return true;
+      if (accept === "digit" && /[0-9]/.test(value)) return true;
+      if (typeof accept === "function" && accept(value, match)) return true;
+    }
+  }
+  return false;
+}
+
+function prettyPath(path, home) {
+  const absolute = resolve(path);
+  if (absolute === home) return "~";
+  if (absolute.startsWith(home + "/")) return "~/" + absolute.slice(home.length + 1);
+  return absolute;
+}
+
+function prettySize(size) {
+  if (size < 1024) return `${size} Б`;
+  if (size < 1024 * 1024) return `${Math.round(size / 1024)} КБ`;
+  return `${(size / (1024 * 1024)).toFixed(1).replace(".", ",")} МБ`;
+}
+
+function prettyCount(count, words = ["файл", "файла", "файлов"]) {
+  const mod10 = count % 10;
+  const mod100 = count % 100;
+  const word = mod10 === 1 && mod100 !== 11 ? words[0] : mod10 >= 2 && mod10 <= 4 && !(mod100 >= 12 && mod100 <= 14) ? words[1] : words[2];
+  return `${count} ${word}`;
+}
+
+function skipReason(name) {
+  const lower = name.toLowerCase();
+  if (lower.startsWith(".env") || lower.startsWith("id_") || ["secret", "credential", "token"].some((word) => lower.includes(word))) return "похоже на ключи";
+  if ([".pem", ".key", ".p12", ".pfx"].some((ext) => lower.endsWith(ext))) return "похоже на ключи";
+  if (![".md", ".markdown", ".txt"].some((ext) => lower.endsWith(ext))) return "не текст";
+  return null;
+}
+
+function inspectMemoryFile(path, home, skipped, secrets) {
+  const name = path.split("/").pop();
+  const shown = prettyPath(path, home);
+  try {
+    if (lstatSync(path).isSymbolicLink()) {
+      skipped.push([shown, "симлинк"]);
+      return null;
+    }
+    const reason = skipReason(name);
+    if (reason) {
+      skipped.push([shown, reason]);
+      return null;
+    }
+    const size = statSync(path).size;
+    if (size > 256 * 1024) {
+      skipped.push([shown, "больше 256 КБ"]);
+      return null;
+    }
+    const data = readFileSync(path);
+    if (data.subarray(0, 8192).includes(0)) {
+      skipped.push([shown, "не текст"]);
+      return null;
+    }
+    let inPrivateKey = false;
+    const fileLines = data.toString("utf8").split(/\r?\n/);
+    // Перевод строки в конце файла — не ещё одна строка (python splitlines считает так же).
+    if (fileLines.length > 1 && fileLines[fileLines.length - 1] === "") fileLines.pop();
+    fileLines.forEach((line, index) => {
+      const begins = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/.test(line);
+      const ends = /-----END [A-Z0-9 ]*PRIVATE KEY-----/.test(line);
+      if (inPrivateKey || begins || lineHasSecret(line)) secrets.push([shown, index + 1]);
+      if (inPrivateKey && ends) inPrivateKey = false;
+      if (begins && !ends) inPrivateKey = true;
+    });
+    return size;
+  } catch {
+    skipped.push([shown, "не прочитал"]);
+    return null;
+  }
+}
+
+function walkMemoryDir(root, home, skipped, secrets) {
+  let count = 0;
+  let total = 0;
+  let entries;
+  try {
+    entries = readdirSync(root, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+  } catch {
+    skipped.push([prettyPath(root, home), "не прочитал"]);
+    return [count, total];
+  }
+  for (const entry of entries) {
+    const path = join(root, entry.name);
+    const shown = prettyPath(path, home);
+    try {
+      if (entry.isSymbolicLink()) {
+        skipped.push([shown, "симлинк"]);
+        continue;
+      }
+      if (entry.isDirectory()) {
+        if (entry.name.startsWith(".")) skipped.push([shown + "/", "скрытая папка"]);
+        else if (entry.name === "node_modules") skipped.push([shown + "/", "node_modules"]);
+        else {
+          const [subcount, subtotal] = walkMemoryDir(path, home, skipped, secrets);
+          count += subcount;
+          total += subtotal;
+        }
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (["CLAUDE.md", "AGENTS.md"].includes(entry.name)) {
+        skipped.push([shown, "правила команды"]);
+        continue;
+      }
+      const size = inspectMemoryFile(path, home, skipped, secrets);
+      if (size !== null) {
+        count += 1;
+        total += size;
+      }
+    } catch {
+      skipped.push([shown, "не прочитал"]);
+    }
+  }
+  return [count, total];
+}
+
+function customMemoryDirs(home) {
+  const dirs = [];
+  const seen = new Set();
+  for (const raw of (process.env.TASKLESS_MEMORY_DIRS || "").split("\n")) {
+    if (!raw) continue;
+    const expanded = raw === "~" ? home : raw.startsWith("~/") ? join(home, raw.slice(2)) : raw;
+    const path = resolve(expanded);
+    if (seen.has(path)) continue;
+    seen.add(path);
+    dirs.push([path, raw]);
+  }
+  return dirs;
+}
+
+function validateMemoryDirs() {
+  const home = resolve(process.env.HOME || "");
+  for (const [path, raw] of customMemoryDirs(home)) {
+    let directory = false;
+    try {
+      directory = statSync(path).isDirectory();
+    } catch {}
+    if (!directory) throw new Error(`Нет такой папки: ${raw}`);
+  }
+}
+
+function secretRanges(secrets) {
+  const ranges = [];
+  for (const [path, number] of secrets) {
+    const last = ranges[ranges.length - 1];
+    if (last && last[0] === path && last[2] === number - 1) last[2] = number;
+    else ranges.push([path, number, number]);
+  }
+  return ranges;
+}
+
+function memoryScan(output) {
+  const home = resolve(process.env.HOME || "");
+  validateMemoryDirs();
+  const files = [
+    [join(home, ".claude", "CLAUDE.md"), "правила"],
+    [join(home, ".codex", "AGENTS.md"), "правила"],
+  ];
+  const claudeDirs = [];
+  const projects = join(home, ".claude", "projects");
+  try {
+    for (const entry of readdirSync(projects, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const memory = join(projects, entry.name, "memory");
+      if (!entry.isSymbolicLink() && entry.isDirectory() && existsSync(memory) && statSync(memory).isDirectory() && !lstatSync(memory).isSymbolicLink()) claudeDirs.push(memory);
+    }
+  } catch {}
+  const dirs = ["memories", "memories_v2"].map((name) => [join(home, ".codex", name), "память Codex"]);
+  dirs.push(...customMemoryDirs(home).map(([path]) => [path, "твоя папка"]));
+  const rows = [];
+  const skipped = [];
+  const secrets = [];
+  let total = 0;
+  for (const [path, label] of files) {
+    if (!existsSync(path)) continue;
+    const size = inspectMemoryFile(path, home, skipped, secrets);
+    if (size !== null) {
+      rows.push(`  ${prettyPath(path, home)} — ${prettySize(size)}, ${label}`);
+      total += size;
+    }
+  }
+  let claudeCount = 0;
+  let claudeSize = 0;
+  for (const path of claudeDirs) {
+    const [count, size] = walkMemoryDir(path, home, skipped, secrets);
+    claudeCount += count;
+    claudeSize += size;
+  }
+  if (claudeCount) {
+    rows.push(`  ~/.claude/projects/…/memory/ — ${prettyCount(claudeCount)}, ${prettySize(claudeSize)}, память Claude Code`);
+    total += claudeSize;
+  }
+  for (const [path, label] of dirs) {
+    if (!existsSync(path)) continue;
+    if (lstatSync(path).isSymbolicLink()) {
+      skipped.push([prettyPath(path, home), "симлинк"]);
+      continue;
+    }
+    const [count, size] = walkMemoryDir(path, home, skipped, secrets);
+    if (count) {
+      rows.push(`  ${prettyPath(path, home)}/ — ${prettyCount(count)}, ${prettySize(size)}, ${label}`);
+      total += size;
+    }
+  }
+  const lines = [...rows];
+  if (rows.length) lines.push(`Всего ${prettySize(total)}. Агент за раз читает до 200 КБ, остальное — по выбору человека.`);
+  if (skipped.length) {
+    const first = skipped.slice(0, 10).map(([path, reason]) => `${path} — ${reason}`).join("; ");
+    const rest = skipped.length > 10 ? `; и ещё ${skipped.length - 10}` : "";
+    lines.push(`Пропущены: ${first}${rest}.`);
+  }
+  for (const [path, first, last] of secretRanges(secrets)) {
+    if (first === last) lines.push(`Похоже на секрет: ${path}, строка ${first}. Эту строку в записи не бери.`);
+    else lines.push(`Похоже на секрет: ${path}, строки ${first}–${last}. Эти строки в записи не бери.`);
+  }
+  writeFileSync(output, lines.length ? lines.join("\n") + "\n" : "", "utf8");
+  emitMemoryField("memory_found", rows.length ? 1 : 0);
+}
+
+const IMPORT_KINDS = new Set(["fact", "rule", "decision", "promise"]);
+const IMPORT_SOURCES = new Set(["instructions", "agent_memory", "notes"]);
+const IMPORT_CLIENTS = new Set(["claude-code", "codex", "grok", "zcode", "cursor", "gemini", "other"]);
+const IMPORT_MODIFIED_AT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+
+function validModifiedAt(value) {
+  return typeof value === "string" && IMPORT_MODIFIED_AT.test(value) && !Number.isNaN(Date.parse(value));
+}
+
+function readImportBatch(path) {
+  let batch;
+  try {
+    batch = JSON.parse(readFileSync(path, "utf8"));
+  } catch (err) {
+    throw new Error(`Не прочитал JSON ${path}: ${err.message}`);
+  }
+  if (!batch || typeof batch !== "object" || !Array.isArray(batch.files)) throw new Error(`Не тот формат ${path}: нужен объект с массивом files`);
+  if ("client" in batch && !IMPORT_CLIENTS.has(batch.client)) throw new Error(`Не тот формат ${path}: неизвестный client`);
+  batch.files.forEach((file, fileIndex) => {
+    const where = `файл ${fileIndex + 1}`;
+    if (!file || typeof file !== "object") throw new Error(`${where}: нужен объект`);
+    if (typeof file.path !== "string" || file.path.length < 1 || file.path.length > 500) throw new Error(`${where}: path — строка от 1 до 500 знаков`);
+    if (!IMPORT_SOURCES.has(file.source)) throw new Error(`${where}: source — instructions, agent_memory или notes`);
+    if ("modifiedAt" in file && !validModifiedAt(file.modifiedAt)) throw new Error(`${where}: modifiedAt — дата ISO 8601 с часовым поясом`);
+    if (!Array.isArray(file.items)) throw new Error(`${where}: items — массив записей`);
+    if (file.items.length > 300) throw new Error(`${where}: больше 300 записей, раздели их между файлами`);
+    file.items.forEach((item, itemIndex) => {
+      const place = `${where}, запись ${itemIndex + 1}`;
+      if (!item || typeof item !== "object" || typeof item.statement !== "string") throw new Error(`${place}: statement — строка`);
+      if ("kind" in item && !IMPORT_KINDS.has(item.kind)) throw new Error(`${place}: kind — fact, rule, decision или promise`);
+      if ("quote" in item && typeof item.quote !== "string") throw new Error(`${place}: quote — строка`);
+    });
+  });
+  if (batch.files.reduce((sum, file) => sum + file.items.length, 0) === 0) throw new Error(`Пустая пачка ${path}: нужна хотя бы одна запись`);
+  return batch;
+}
+
+function importBatches(batch) {
+  const batches = [];
+  let current = [];
+  let count = 0;
+  for (const file of batch.files) {
+    if (current.length && count + file.items.length > 300) {
+      batches.push(current);
+      current = [];
+      count = 0;
+    }
+    current.push(file);
+    count += file.items.length;
+  }
+  if (current.length) batches.push(current);
+  return batches;
+}
+
+function writeImportReport(output, reports, dryFiles = null) {
+  const lines = [];
+  if (dryFiles !== null) {
+    const totalItems = dryFiles.reduce((sum, file) => sum + file.items.length, 0);
+    lines.push(`Проверка: ушло бы ${prettyCount(totalItems, ["запись", "записи", "записей"])}, запросов не отправил.`);
+    for (const file of dryFiles) lines.push(`  ${file.path} — ${prettyCount(file.items.length, ["запись", "записи", "записей"])}`);
+  } else {
+    const total = Object.fromEntries(["new", "known", "duplicate", "skipped"].map((key) => [key, reports.reduce((sum, report) => sum + (Number(report[key]) || 0), 0)]));
+    lines.push(`Взял новых: ${total.new}. Уже было: ${total.known}. Повтор: ${total.duplicate}. Пропущено: ${total.skipped}`);
+    const reasonNames = [["secret", "секрет"], ["too_long", "длиннее 300 знаков"], ["empty", "пусто"], ["rule_without_quote", "правило без цитаты"], ["retracted", "ты это раньше удалил"], ["error", "ошибка"]];
+    const reasons = [];
+    for (const [key, label] of reasonNames) {
+      const count = reports.reduce((sum, report) => sum + (Number(report.skippedByReason?.[key]) || 0), 0);
+      if (count) reasons.push(`${label} — ${count}`);
+    }
+    if (reasons.length) lines.push(`Причины пропусков: ${reasons.join("; ")}`);
+    for (const report of reports) {
+      for (const file of report.files || []) lines.push(`  ${file.file || ""} — новых ${Number(file.new) || 0}, уже было ${Number(file.known) || 0}, повтор ${Number(file.duplicate) || 0}, пропущено ${Number(file.skipped) || 0}`);
+    }
+  }
+  writeFileSync(output, lines.join("\n") + "\n", "utf8");
+}
+
+async function memoryImport(path, output, dry) {
+  const batch = readImportBatch(path);
+  if (dry) {
+    writeImportReport(output, [], batch.files);
+    return;
+  }
+  const reports = [];
+  let sent = 0;
+  const totalItems = batch.files.reduce((sum, file) => sum + file.items.length, 0);
+  for (const files of importBatches(batch)) {
+    const payload = { files };
+    if ("client" in batch) payload.client = batch.client;
+    const r = await request("POST", apiBase() + "/memory/personal/import", payload, process.env.TASKLESS_TOKEN || "");
+    if (r.status !== 200) {
+      if (reports.length) {
+        writeImportReport(output, reports);
+        writeFileSync(output, `${readFileSync(output, "utf8")}Отправил ${sent} из ${prettyCount(totalItems, ["запись", "записи", "записей"])}, дальше остановился:\n`, "utf8");
+      }
+      throw new Error(serverMessage(r.payload, r.net));
+    }
+    reports.push(r.payload);
+    sent += files.reduce((sum, file) => sum + file.items.length, 0);
+  }
+  writeImportReport(output, reports);
+}
+
 const cmd = process.argv[2];
 if (cmd === "device_start") {
   const r = await request("POST", apiBase() + "/oauth/device_authorization", devicePayload(), "");
@@ -1016,10 +2617,48 @@ if (cmd === "device_start") {
     process.stderr.write("edit: не знаю действие\n");
     process.exit(1);
   }
+} else if (cmd === "json") {
+  const action = process.argv[3];
+  const path = process.argv[4];
+  const dry = process.argv[5] === "1";
+  if (action === "apply") jsonApply(path, dry);
+  else if (action === "remove") jsonRemove(path, dry);
+  else if (action === "status") jsonStatus(path);
+  else {
+    process.stderr.write("json: не знаю действие\n");
+    process.exit(1);
+  }
+} else if (cmd === "toml_block") {
+  tomlBlock();
 } else if (cmd === "meta_write") {
   metaWrite();
 } else if (cmd === "meta_read") {
   metaRead();
+} else if (cmd === "memory_state") {
+  await memoryState();
+} else if (cmd === "memory_set") {
+  try {
+    await memorySet(process.argv[3]);
+  } catch (err) {
+    process.stderr.write(`${err.message}\n`);
+    process.exit(1);
+  }
+} else if (cmd === "memory_validate_dirs") {
+  try {
+    validateMemoryDirs();
+  } catch (err) {
+    process.stderr.write(`${err.message}\n`);
+    process.exit(1);
+  }
+} else if (cmd === "memory_scan") {
+  memoryScan(process.argv[3]);
+} else if (cmd === "memory_import") {
+  try {
+    await memoryImport(process.argv[3], process.argv[4], process.argv[5] === "1");
+  } catch (err) {
+    process.stderr.write(`${err.message}\n`);
+    process.exit(1);
+  }
 } else {
   process.stderr.write("не знаю команду\n");
   process.exit(1);
@@ -1052,6 +2691,9 @@ parse_kv() {
   EDIT_CHANGED=
   EDIT_BACKUP=
   META_DEVICE=
+  MEMORY_STATE=
+  MEMORY_FOUND=
+  SERVER_MESSAGE=
   while IFS= read -r line; do
     key=${line%%=*}
     val=${line#*=}
@@ -1069,6 +2711,9 @@ parse_kv() {
       changed) EDIT_CHANGED=$val ;;
       backup) EDIT_BACKUP=$val ;;
       device_name) META_DEVICE=$val ;;
+      memory_state) MEMORY_STATE=$val ;;
+      memory_found) MEMORY_FOUND=$val ;;
+      server_message) SERVER_MESSAGE=$val ;;
     esac
   done
 }
@@ -1198,7 +2843,7 @@ save_key() {
   if [ "$forced" != "file" ] && [ "$(uname -s)" != "Darwin" ] && command -v secret-tool >/dev/null 2>&1; then
     if printf '%s' "$token" | secret-tool store --label='Taskless device key' service taskless account device >/dev/null 2>&1; then
       STORE_KIND=secret
-      rm -f "$KEY_FILE"
+      write_secret_file "$CONFIG_DIR" "$KEY_FILE" "$token"
       return 0
     fi
   fi
@@ -1398,15 +3043,141 @@ apply_stub() {
   fi
 }
 
+export_mcp_config() {
+  TASKLESS_MCP_URL="$BASE/mcp"
+  TASKLESS_HEADER_COMMAND="sh \"$CONFIG_DIR/mcp-headers\""
+  export TASKLESS_MCP_URL TASKLESS_HEADER_COMMAND
+}
+
+apply_key_helper() {
+  dry=$1
+  bodyfile=$(mktemp)
+  cat > "$bodyfile" <<'TASKLESS_KEY_HELPER_END'
+#!/bin/sh
+set -eu
+key=
+if [ "${TASKLESS_KEY_STORE:-auto}" != "file" ] && [ "$(uname -s)" = "Darwin" ] && command -v security >/dev/null 2>&1; then
+  key=$(security find-generic-password -a taskless -s taskless-device -w 2>/dev/null || true)
+fi
+if [ "${TASKLESS_KEY_STORE:-auto}" != "file" ] && [ "$(uname -s)" != "Darwin" ] && command -v secret-tool >/dev/null 2>&1; then
+  key=$(secret-tool lookup service taskless account device 2>/dev/null || true)
+fi
+if [ -z "$key" ]; then
+  keyfile="$HOME/.config/taskless/device-key"
+  [ -f "$keyfile" ] || exit 1
+  key=$(tr -d '\r\n' < "$keyfile")
+fi
+[ -n "$key" ] || exit 1
+printf '{"Authorization":"Bearer %s"}\n' "$key"
+TASKLESS_KEY_HELPER_END
+  rc=0
+  capture_helper edit apply "$CONFIG_DIR/mcp-headers" "# >>> taskless:key-helper" "# <<< taskless:key-helper" "$dry" 700 < "$bodyfile" || rc=$?
+  rm -f "$bodyfile"
+  if [ "$rc" != 0 ]; then
+    exit "$rc"
+  fi
+}
+
+claude_config_connected() {
+  export_mcp_config
+  capture_helper json status "$HOME/.claude.json" 0 || return 1
+  [ "$EDIT_CHANGED" = 1 ]
+}
+
+codex_config_connected() {
+  file="$HOME/.codex/config.toml"
+  [ -f "$file" ] && grep -q '^# >>> taskless:codex$' "$file" && grep -q '^# <<< taskless:codex$' "$file"
+}
+
+remove_key_helper_if_unused() {
+  dry=$1
+  if claude_config_connected || codex_config_connected; then
+    EDIT_CHANGED=0
+    return 0
+  fi
+  capture_helper edit remove "$CONFIG_DIR/mcp-headers" "# >>> taskless:key-helper" "# <<< taskless:key-helper" "$dry" 700 || exit $?
+}
+
+apply_claude() {
+  dry=$1
+  apply_key_helper "$dry"
+  export_mcp_config
+  capture_helper json apply "$HOME/.claude.json" "$dry" || exit $?
+  if [ "$dry" = 1 ]; then
+    printf '%s\n' "  claude plugin marketplace add taskless-app/taskless"
+    printf '%s\n' "  claude plugin install taskless@taskless-app --scope user"
+    return 0
+  fi
+  if ! command -v claude >/dev/null 2>&1; then
+    printf '%s\n' "Нет claude в PATH. Сервер и ключ прописаны, плагин поставь командами:"
+    printf '%s\n' "  claude plugin marketplace add taskless-app/taskless"
+    printf '%s\n' "  claude plugin install taskless@taskless-app --scope user"
+    return 0
+  fi
+  claude plugin marketplace add taskless-app/taskless || die "Не поставил маркетплейс Claude Code."
+  claude plugin install taskless@taskless-app --scope user || die "Не поставил плагин Claude Code."
+}
+
+apply_codex() {
+  dry=$1
+  apply_key_helper "$dry"
+  export_mcp_config
+  bodyfile=$(mktemp)
+  run_helper toml_block > "$bodyfile"
+  rc=0
+  capture_helper edit apply "$HOME/.codex/config.toml" "# >>> taskless:codex" "# <<< taskless:codex" "$dry" 600 < "$bodyfile" || rc=$?
+  rm -f "$bodyfile"
+  if [ "$rc" != 0 ]; then
+    exit "$rc"
+  fi
+  if [ "$dry" = 1 ]; then
+    printf '%s\n' "  codex plugin marketplace add taskless-app/taskless"
+    printf '%s\n' "  codex plugin add taskless@taskless-app"
+    return 0
+  fi
+  if ! command -v codex >/dev/null 2>&1; then
+    printf '%s\n' "Нет codex в PATH. Сервер и ключ прописаны, плагин поставь командами:"
+    printf '%s\n' "  codex plugin marketplace add taskless-app/taskless"
+    printf '%s\n' "  codex plugin add taskless@taskless-app"
+    return 0
+  fi
+  codex plugin marketplace add taskless-app/taskless || die "Не поставил маркетплейс Codex."
+  codex plugin add taskless@taskless-app || die "Не поставил плагин Codex."
+}
+
 agent_remove() {
   id=$1
   dry=$2
   EDIT_CHANGED=0
   EDIT_BACKUP=
+  changed_any=0
   if stub_wants "$id"; then
     file=$(stub_file "$id")
     capture_helper edit remove "$file" "# >>> taskless:$id" "# <<< taskless:$id" "$dry" 644 || exit $?
+    return 0
   fi
+  case "$id" in
+    claude-code)
+      if [ "$dry" != 1 ] && command -v claude >/dev/null 2>&1; then
+        claude plugin uninstall taskless@taskless-app --scope user >/dev/null 2>&1 || true
+      fi
+      export_mcp_config
+      capture_helper json remove "$HOME/.claude.json" "$dry" || exit $?
+      if [ "$EDIT_CHANGED" = 1 ]; then changed_any=1; fi
+      remove_key_helper_if_unused "$dry"
+      if [ "$EDIT_CHANGED" = 1 ]; then changed_any=1; fi
+      ;;
+    codex)
+      if [ "$dry" != 1 ] && command -v codex >/dev/null 2>&1; then
+        codex plugin remove taskless@taskless-app >/dev/null 2>&1 || true
+      fi
+      capture_helper edit remove "$HOME/.codex/config.toml" "# >>> taskless:codex" "# <<< taskless:codex" "$dry" 600 || exit $?
+      if [ "$EDIT_CHANGED" = 1 ]; then changed_any=1; fi
+      remove_key_helper_if_unused "$dry"
+      if [ "$EDIT_CHANGED" = 1 ]; then changed_any=1; fi
+      ;;
+  esac
+  EDIT_CHANGED=$changed_any
 }
 
 preview_install() {
@@ -1425,7 +3196,17 @@ preview_install() {
     fi
     return 0
   fi
-  printf '%s: адаптер ещё не подключает клиент\n' "$name"
+  case "$id" in
+    claude-code)
+      printf '%s: прописал бы ~/.claude.json и плагин taskless@taskless-app\n' "$name"
+      apply_claude 1
+      ;;
+    codex)
+      printf '%s: прописал бы ~/.codex/config.toml и плагин taskless@taskless-app\n' "$name"
+      apply_codex 1
+      ;;
+    *) printf '%s: адаптер ещё не подключает клиент\n' "$name" ;;
+  esac
 }
 
 real_install() {
@@ -1443,7 +3224,17 @@ real_install() {
     fi
     return 0
   fi
-  printf '%s: адаптер ещё не подключает клиент\n' "$name"
+  case "$id" in
+    claude-code)
+      apply_claude 0
+      printf '%s: сервер и ключ прописаны\n' "$name"
+      ;;
+    codex)
+      apply_codex 0
+      printf '%s: сервер и ключ прописаны\n' "$name"
+      ;;
+    *) printf '%s: адаптер ещё не подключает клиент\n' "$name" ;;
+  esac
 }
 
 save_meta() {
@@ -1453,6 +3244,130 @@ save_meta() {
   TASKLESS_AGENTS=$(comma_ids "$connected")
   export TASKLESS_AGENTS
   capture_helper meta_write "$META_FILE" || die "Не записал сведения об устройстве."
+}
+
+print_memory_import_steps() {
+  n=$1
+  printf '%s. Спроси, забирать ли найденную память. Если нет — на этом всё.\n' "$n"
+  n=$((n + 1))
+  printf '%s. Прочитай файлы из списка, всего не больше 200 КБ текста. Если файлов больше, спроси, какие взять.\n' "$n"
+  n=$((n + 1))
+  printf '%s. Составь короткие записи: одно утверждение — одна запись, до 300 знаков. Вид: fact, rule, decision или promise. Для правила положи в quote дословную строку из файла. Пароли, токены, ключи и строки с пометкой «похоже на секрет» не бери.\n' "$n"
+  n=$((n + 1))
+  printf '%s. Покажи записи человеку по файлам и спроси: «Отправить в Taskless?» Убери то, что он попросит. Без явного «да» ничего не отправляй.\n' "$n"
+  n=$((n + 1))
+  printf '%s. Запиши пачку во временный файл JSON (формат: https://taskless.ru/invite-agent#memory-format) и запусти:\n' "$n"
+  printf '   curl -fsSL https://taskless.ru/connect.sh | sh -s -- --import-memory <файл>\n'
+  n=$((n + 1))
+  printf '%s. Перескажи человеку отчёт установщика и удали временный файл.\n' "$n"
+}
+
+print_memory_intro_steps() {
+  printf '%s\n' "1. Расскажи человеку о личной памяти и спроси, включить ли её. Агенты во всех его подключениях будут помнить его правила, решения и факты о работе. Записи видит только он: ни админ, ни команда, ни рой. Выключить и удалить всё можно в профиле Taskless, раздел «Личная память»."
+  printf '%s\n' "2. Ответ запиши командой:"
+  printf '%s\n' "   curl -fsSL https://taskless.ru/connect.sh | sh -s -- --memory on"
+  printf '%s\n' "   Если человек против — та же команда с --memory off, и на этом всё."
+}
+
+scan_memory() {
+  report=$(mktemp)
+  export TASKLESS_MEMORY_DIRS="$MEMORY_DIRS"
+  if ! capture_helper memory_scan "$report"; then
+    rm -f "$report"
+    printf '%s\n' "Не смог поискать память на компьютере."
+    return 1
+  fi
+  if [ "$MEMORY_FOUND" = 1 ]; then
+    printf '%s\n' "Память на этом компьютере. В Taskless пока ничего не ушло."
+  else
+    printf '%s\n' "Памяти агентов на компьютере не нашёл"
+  fi
+  if [ "$MEMORY_FOUND" = 1 ] || [ "$DRY" = 1 ]; then
+    cat "$report"
+  fi
+  rm -f "$report"
+  return 0
+}
+
+report_memory() {
+  printf '\n'
+  if [ "$DRY" = 1 ]; then
+    scan_memory || return 0
+    printf '%s\n' "Это проверка. Что делать с памятью, установщик скажет при настоящем запуске."
+    return 0
+  fi
+  export TASKLESS_TOKEN="$TOKEN"
+  export_base
+  if ! capture_helper memory_state; then
+    printf '%s\n' "Не узнал, включена ли личная память: помощник не запустился"
+    return 0
+  fi
+  if [ "$HTTP_STATUS" != 200 ]; then
+    printf 'Не узнал, включена ли личная память: %s\n' "${SERVER_MESSAGE:-$HTTP_NET}"
+    return 0
+  fi
+  if [ "$MEMORY_STATE" = "off" ]; then
+    printf '%s\n' "Личная память Taskless выключена, память с компьютера не ищу. Включить её можно в профиле, раздел «Личная память»."
+    return 0
+  fi
+  memory_state_saved=$MEMORY_STATE
+  scan_memory || return 0
+  if [ "$memory_state_saved" = "on" ]; then
+    if [ "$MEMORY_FOUND" = 1 ]; then
+      printf '\n%s\n' "Агенту: как забрать эту память в Taskless"
+      print_memory_import_steps 1
+    fi
+    return 0
+  fi
+  printf '\n%s\n' "Агенту: личная память Taskless пока не включена"
+  print_memory_intro_steps
+  if [ "$MEMORY_FOUND" = 1 ]; then
+    print_memory_import_steps 3
+  fi
+}
+
+do_memory_set() {
+  if [ "$DRY" = 1 ]; then
+    if [ "$MEMORY_SET" = "on" ]; then
+      printf '%s\n' "Проверка: включил бы личную память, запросов не отправил."
+    else
+      printf '%s\n' "Проверка: выключил бы личную память, запросов не отправил."
+    fi
+    return 0
+  fi
+  if ! load_key; then
+    printf '%s\n' "Сначала подключи агентов: запусти установщик без флагов" >&2
+    return 1
+  fi
+  export TASKLESS_TOKEN="$TOKEN"
+  export_base
+  capture_helper memory_set "$MEMORY_SET" || return 1
+  if [ "$MEMORY_SET" = "on" ]; then
+    printf '%s\n' "Личная память включена."
+  else
+    printf '%s\n' "Личная память выключена. Записи, если были, остались, удалить их можно в профиле."
+  fi
+}
+
+do_memory_import() {
+  if [ "$DRY" != 1 ]; then
+    if ! load_key; then
+      printf '%s\n' "Сначала подключи агентов: запусти установщик без флагов" >&2
+      return 1
+    fi
+    export TASKLESS_TOKEN="$TOKEN"
+    export_base
+  fi
+  report=$(mktemp)
+  errors=$(mktemp)
+  if ! capture_helper memory_import "$IMPORT_FILE" "$report" "$DRY" 2>"$errors"; then
+    cat "$report"
+    cat "$errors" >&2
+    rm -f "$report" "$errors"
+    return 1
+  fi
+  cat "$report"
+  rm -f "$report" "$errors"
 }
 
 do_install() {
@@ -1473,6 +3388,7 @@ do_install() {
     printf '\n'
     print_manuals
     print_missing
+    report_memory
     return 0
   fi
   ensure_token
@@ -1488,6 +3404,7 @@ do_install() {
   print_manuals
   print_missing
   save_meta "$connected"
+  report_memory
 }
 
 agent_connected() {
@@ -1496,8 +3413,14 @@ agent_connected() {
     if [ -f "$file" ] && grep -q "# >>> taskless:$1" "$file"; then
       return 0
     fi
+    return 1
   fi
-  return 1
+  [ -f "$CONFIG_DIR/mcp-headers" ] || return 1
+  case "$1" in
+    claude-code) claude_config_connected ;;
+    codex) codex_config_connected ;;
+    *) return 1 ;;
+  esac
 }
 
 do_status() {
@@ -1589,6 +3512,21 @@ main() {
   DEVICE_NAME=$(detect_device_name)
   PLATFORM=$(detect_platform)
   OS_VERSION=$(detect_os_version || true)
+  if [ -n "$MEMORY_SET" ]; then
+    prepare_helper
+    do_memory_set
+    exit $?
+  fi
+  if [ -n "$IMPORT_FILE" ]; then
+    prepare_helper
+    do_memory_import
+    exit $?
+  fi
+  if [ -n "$MEMORY_DIRS" ]; then
+    prepare_helper
+    export TASKLESS_MEMORY_DIRS="$MEMORY_DIRS"
+    capture_helper memory_validate_dirs || exit 1
+  fi
   collect_agents
   if [ "$DO_STATUS" = 1 ]; then
     prepare_helper

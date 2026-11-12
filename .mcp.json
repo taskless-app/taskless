@@ -3,6 +3,7 @@
     "taskless": {
       "type": "http",
       "url": "https://taskless.ru/api/mcp",
+      "headersHelper": "node \"${CLAUDE_PLUGIN_ROOT}/connect/plugin-headers.mjs\"",
       "headers": {
         "X-Taskless-Kit": "0.2.2"
       }

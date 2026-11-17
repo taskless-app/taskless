@@ -765,7 +765,13 @@ esac
         expect(readFileSync(setup.codexToml, "utf8"), variant.name).toBe(variant.text);
         removeRealHome(setup);
       }
-    }, 180_000);
+      // tests-packages (прогон 43953284363): python3 семи вариантов не
+      // уложился в 180 с; node того же теста — 23 с. Локально python3
+      // занял 158 с, а соседний цикл на раннере был вдвое медленнее.
+      // 7 вариантов × 4 запуска. spawn даёт python3 до 60 с (выше: на
+      // загруженном self-hosted один запуск бывает дольше 20 с). 180 с на
+      // весь тест обрывает его без ассерта: прогон 43916011865, стек на it.
+    }, 600_000);
   }
 
   for (const runtime of ["node", "python3"]) {
@@ -801,7 +807,8 @@ esac
         expect(readFileSync(setup.codexToml, "utf8"), variant.name).toBe(variant.text);
         removeRealHome(setup);
       }
-    }, 180_000);
+      // Тот же прогон: python3 этого цикла взял 164 с из 180.
+    }, 360_000);
   }
 
   for (const runtime of ["node", "python3"]) {
@@ -2402,7 +2409,9 @@ describe("connect.sh: личная память", () => {
         expect(stub.hits.filter((hit) => !["/memory/personal/settings", "/auth/me"].includes(hit.url))).toHaveLength(0);
         rmSync(home, { recursive: true, force: true });
         rmSync(emptyHome, { recursive: true, force: true });
-      }, 90_000);
+        // Семь запусков подряд. На tests-packages (прогон 43921027962) python3
+        // не уложился в 90 с: vitest оборвал тест на строке it, без ассерта.
+      }, 300_000);
 
       it("--memory on/off шлёт PUT без ключа в argv; dry-run и ошибки не скрывает", async () => {
         const stub = await startStub();
@@ -2450,7 +2459,8 @@ describe("connect.sh: личная память", () => {
         expect(emptyValue.stdout + emptyValue.stderr).toContain("После --memory нужно on или off");
         rmSync(home, { recursive: true, force: true });
         rmSync(noKeyHome, { recursive: true, force: true });
-      }, 90_000);
+        // Шесть запусков подряд, тот же запас, что у соседнего теста на семь.
+      }, 240_000);
 
       it("--import-memory проверяет JSON, делит 650 записей на 3 запроса и печатает отчёт и ошибки", async () => {
         const stub = await startStub();
@@ -2536,7 +2546,8 @@ describe("connect.sh: личная память", () => {
         expect(existsSync(batch)).toBe(true);
         rmSync(home, { recursive: true, force: true });
         rmSync(noKeyHome, { recursive: true, force: true });
-      }, 120_000);
+        // Двенадцать запусков (включая четыре кода отказа). 120 с — меньше 15 с на запуск.
+      }, 360_000);
 
       it("одни пропуски не считаются найденной памятью и не дают шагов чтения", async () => {
         const stub = await startStub();
